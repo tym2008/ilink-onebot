@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ilink-onebot"
+version = "0.1.0"
+description = "WeChat iLink protocol to OneBot v11 bridge (将微信 iLink 协议转换为 OneBot v11 标准协议)"
+readme = "README.md"
+requires-python = ">=3.14"
+authors = [
+    { name = "Foxerine" },
+]
+keywords = ["wechat", "ilink", "onebot", "bridge", "bot"]
+dependencies = [
+    # 领域模型基础设施
+    "sqlmodel-ext>=0.3.3",
+    # DB 驱动 + 迁移
+    "aiosqlite>=0.20",
+    "alembic>=1.13",
+    "anyio>=4.4",
+    # HTTP 客户端
+    "aiohttp[speedups]>=3.10",
+    "charset-normalizer>=3.0",
+    "yarl>=1.12",
+    # FastAPI 媒体服务
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    # WebSocket 服务端（OneBot v11）
+    "websockets>=13.0",
+    # CLI
+    "typer>=0.15",
+    # QR 码（终端渲染）
+    "qrcode[pil]>=7.4",
+    # 配置
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    # 加密（AES-128-ECB，支持流式 update/finalize）
+    "cryptography>=43.0",
+    # 序列化
+    "orjson>=3.10",
+    # 日志
+    "loguru>=0.7",
+    # 异步文件
+    "aiofiles>=24.1",
+    "pilk>=0.2.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "basedpyright>=1.24",
+    "ruff>=0.8",
+    # 单文件 exe 打包
+    "pyinstaller>=6.10",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["sqlmodels", "onebots", "fastapis", "typers", "utils"]
+
+[project.scripts]
+ilink-onebot = "typers:app"
+
+[tool.basedpyright]
+pythonVersion = "3.14"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
+reportImportCycles = false
+reportAny = false
+reportExplicitAny = false
+reportUnknownVariableType = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportMissingTypeStubs = false
+# Alembic 自动生成的迁移引用 `sqlmodel.sql.sqltypes.AutoString` — stub 不识别，
+# 但运行时正常。迁移由工具产生，不做手工维护，跳过类型检查
+exclude = ["alembic/versions"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B"]
+ignore = ["E501"]

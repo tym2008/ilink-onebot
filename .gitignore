@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# uv
+uv.lock
+
+# Project data
+.env
+data/
+logs/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Temp
+temp/
+tmp/
+*.tmp
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
+.basedpyright/
+
+# PyInstaller build artifacts（spec 文件保留版本控制，其他产物忽略）
+build/
+dist/
+*.manifest
