@@ -87,30 +87,65 @@ def image_aes_key_to_hex(key: bytes) -> str:
 
 def cdn_aes_key_from_base64(b64_str: str) -> bytes:
     """
-    从 base64 字符串解码 CDN media 的 AES key（``media.aes_key``）。
+    从 base64 字符串解码 CDN media 的 AES key（``CDNMedia.aes_key``）。
 
-    协议规定 ``CDNMedia.aes_key`` 是 base64 编码的 raw 16 字节。
-    VOICE / FILE / VIDEO 段都用此函数；IMAGE 段的 fallback 路径也用此。
+    野外存在两种编码（对齐官方 ``pic-decrypt.ts:parseAesKey``）：
 
-    :raises ValueError: 解码后非 16 字节
+    - **base64(raw 16 bytes)** → IMAGE 段 fallback 路径
+    - **base64(hex string of 16 bytes)** → FILE / VOICE / VIDEO 段
+      （base64 解码后是 32 字符 ASCII hex 字符串，需要再 ``bytes.fromhex`` 一次）
+
+    本函数自适应两种编码：先 base64 解码，按解码后长度决定是否再做一次 hex 解码。
+
+    :raises ValueError: base64 / hex 解码失败，或最终密钥非 16 字节
     """
     try:
-        key = base64.b64decode(b64_str)
+        decoded = base64.b64decode(b64_str)
     except (ValueError, BinasciiError) as e:
         raise ValueError(f"Invalid base64 in media aes_key: {e}") from e
-    if len(key) != AES_KEY_LENGTH:
-        raise ValueError(
-            f"Media aes_key length mismatch: expected {AES_KEY_LENGTH} bytes, "
-            f"got {len(key)} bytes"
-        )
-    return key
+
+    if len(decoded) == AES_KEY_LENGTH:
+        return decoded
+
+    if len(decoded) == 2 * AES_KEY_LENGTH:
+        # 形如 FILE / VOICE / VIDEO：base64 解码后是 32 字符 hex 字符串
+        try:
+            hex_str = decoded.decode('ascii')
+        except UnicodeDecodeError as e:
+            raise ValueError(
+                f"Media aes_key 32-byte payload contains non-ASCII bytes: {e}"
+            ) from e
+        try:
+            key = bytes.fromhex(hex_str)
+        except ValueError as e:
+            raise ValueError(
+                f"Media aes_key 32-byte payload is not valid hex (got {hex_str!r}): {e}"
+            ) from e
+        if len(key) != AES_KEY_LENGTH:
+            raise ValueError(
+                f"Media aes_key hex-decoded length mismatch: "
+                f"expected {AES_KEY_LENGTH} bytes, got {len(key)} bytes"
+            )
+        return key
+
+    raise ValueError(
+        f"Media aes_key length unexpected: base64 decoded to {len(decoded)} bytes "
+        f"(expected {AES_KEY_LENGTH} raw or {2 * AES_KEY_LENGTH} hex chars)"
+    )
 
 
 def cdn_aes_key_to_base64(key: bytes) -> str:
-    """把 16 字节 CDN media AES key 编码为 base64（用于出站 ``media.aes_key``）"""
+    """
+    把 16 字节 raw AES key 编码为出站 ``CDNMedia.aes_key`` 协议格式。
+
+    与官方 ``send.ts`` 一致：先 ``key.hex()`` 转 32 字符 ASCII hex，再 base64 包裹。
+    iLink 服务端解析此字段同样走 ``parseAesKey`` 的自适应路径，支持 base64(raw) 和
+    base64(hex) 两种；本端出站统一用 hex 形式与官方实现对齐。
+    """
     if len(key) != AES_KEY_LENGTH:
         raise ValueError(f"AES key must be {AES_KEY_LENGTH} bytes, got {len(key)}")
-    return base64.b64encode(key).decode('ascii')
+    hex_str = key.hex()
+    return base64.b64encode(hex_str.encode('ascii')).decode('ascii')
 
 
 def generate_aes_key() -> bytes:

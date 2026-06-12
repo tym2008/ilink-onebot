@@ -1,5 +1,12 @@
 # ilink-onebot
 
+![status](https://img.shields.io/badge/status-WIP-orange) ![python](https://img.shields.io/badge/python-3.14%2B-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+
+> [!WARNING]
+> **🚧 开发中（Work In Progress）**
+> 本项目仍处于早期开发阶段，API、配置项、数据库 schema 与运行行为**可能随时发生不兼容变更**，
+> 尚未在生产环境充分验证。请勿用于关键生产场景。欢迎试用、提 Issue 与 PR——但请自行承担风险。
+
 **让你的 NoneBot2、AstrBot 等 OneBot v11 兼容框架直接收发微信消息。**
 
 微信于 2026 年 3 月通过 **ClawBot 插件**正式开放了首个官方个人号 Bot API（iLink
