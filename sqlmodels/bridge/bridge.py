@@ -765,7 +765,7 @@ class Bridge(
         反查 OneBot user_id 对应的 iLink user_id。
 
         SHA-256 截断哈希是单向的，必须曾经被 ``resolve_user_id`` 处理过才能反查。
-        逻辑：先查内存缓存，未命中则扫描 ContextToken 表逐行 hash 填充。
+        逻辑：先查内存缓存，未命中则扫描 ContextToken 表逐行 hash 填充并反查。
         """
         registry = self.get_id_registry()
         cached = registry.lookup_user_name_cached(onebot_user_id)
@@ -776,9 +776,12 @@ class Bridge(
         if all_tokens is None:
             return None
         for row in all_tokens:
-            if registry.resolve_user_id(row.user_name) == onebot_user_id:
-                return row.user_name
-        return None
+            registry.resolve_user_id(row.user_name)
+            name = registry.lookup_user_name_cached(onebot_user_id)
+            if name is not None:
+                return name
+
+        return registry.lookup_user_name_cached(onebot_user_id)
 
     async def handle_outbound_send_message(
         self,

@@ -213,24 +213,32 @@ class OneBotMessageIdRegistry(SQLModelBase):
         """
         将 iLink user_name 确定性映射为 OneBot int64 user_id。
 
-        使用 SHA-256 截断为 60 位正整数（避免超出 JS MAX_SAFE_INTEGER (53 位) 可能
-        导致的前端客户端精度丢失问题）。同一 user_name 跨重启始终映射到相同 user_id。
+        使用 SHA-256 截断为 52 位正整数（最大值 0xFFFFFFFFFFFFF = 4503599627370495，
+        严格小于 JavaScript 的 Number.MAX_SAFE_INTEGER = 2^53 - 1 = 9007199254740991，
+        彻底杜绝在 Node.js / Yunzai 等 JS 框架反序列化 JSON 时产生浮点舍入精度截断）。
+        同一 user_name 跨重启始终映射到相同 user_id。
 
-        首次查询会计算哈希并同时写入正反两个缓存字典，后续 ``lookup_user_name_cached``
-        直接命中无需 DB 扫描。
+        首次查询会计算哈希并同时写入正反两个缓存字典，同时将历史 60 位（15 hex）哈希及其在
+        JavaScript float64 舍入后的别名一并写入反向索引，保证新老 ID 与舍入值均能瞬时反查命中。
 
         :param user_name: iLink 的 user_name 字符串
-        :return: 60 位正整数，作为 OneBot 的 user_id
+        :return: 52 位正整数，作为 OneBot 的 user_id
         """
         cached = self._user_name_to_id.get(user_name)
         if cached is not None:
             return cached
 
         digest = hashlib.sha256(user_name.encode('utf-8')).hexdigest()
-        # 取前 15 个 hex 字符 = 60 位，保证为正整数
-        user_id = int(digest[:15], 16)
+        # 取前 13 个 hex 字符 = 52 位，保证为严格安全的 JS 整数
+        user_id = int(digest[:13], 16)
         self._user_name_to_id[user_name] = user_id
         self._user_id_to_name[user_id] = user_name
+
+        # 兼容历史版本 60 位哈希及 JS 端 JSON.parse(double float64) 舍入产生的别名
+        legacy_60 = int(digest[:15], 16)
+        self._user_id_to_name[legacy_60] = user_name
+        self._user_id_to_name[int(float(legacy_60))] = user_name
+
         return user_id
 
     def lookup_user_name_cached(self, onebot_user_id: int) -> str | None:
@@ -240,6 +248,23 @@ class OneBotMessageIdRegistry(SQLModelBase):
         缓存命中返回 user_name；未命中返回 None，调用方应回退到 DB 扫描
         （遍历 ContextToken 表并对每行 ``resolve_user_id``），从而填充缓存。
 
-        SHA-256 截断哈希是单向的，必须通过预先调用过 ``resolve_user_id`` 才能反查。
+        支持直接命中（52 位新 ID、历史 60 位 ID 及其 float 舍入别名）以及
+        对任意被 JS 浮点截断的超长整数的 double 精度等价兜底匹配。
         """
-        return self._user_id_to_name.get(onebot_user_id)
+        # 1. 优先直接匹配缓存（O(1)）
+        cached = self._user_id_to_name.get(onebot_user_id)
+        if cached is not None:
+            return cached
+
+        # 2. 兜底容错：比对 double float 精度等价性（处理历史超出 53 位的各种精度截断值）
+        try:
+            target_float = float(onebot_user_id)
+            for uid, name in list(self._user_id_to_name.items()):
+                if float(uid) == target_float:
+                    # 回填直接索引以加速后续查询
+                    self._user_id_to_name[onebot_user_id] = name
+                    return name
+        except (ValueError, OverflowError):
+            pass
+
+        return None
