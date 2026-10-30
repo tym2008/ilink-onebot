@@ -67,6 +67,7 @@ async def convert_inbound_message(
     session: AsyncSession,
     msg: WeixinMessage,
     id_registry: OneBotMessageIdRegistry,
+    self_id: int | None = None,
 ) -> OneBotPrivateMessageEvent:
     """
     把单条 ``WeixinMessage`` 转换为 OneBot v11 私聊事件。
@@ -100,10 +101,11 @@ async def convert_inbound_message(
 
     onebot_user_id = id_registry.resolve_user_id(msg.from_user_id)
     create_time_seconds = (msg.create_time_ms or int(time.time() * 1000)) // 1000
+    target_self_id = self_id if self_id is not None else bridge.self_id
 
     return OneBotPrivateMessageEvent(
         time=create_time_seconds,
-        self_id=bridge.self_id,
+        self_id=target_self_id,
         sub_type=OneBotPrivateSubTypeEnum.friend,
         message_id=onebot_message_id,
         user_id=onebot_user_id,

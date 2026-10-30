@@ -786,15 +786,19 @@ class Bridge(
         if msg.message_state == ILinkMessageStateEnum.GENERATING:
             return None
 
+        # 提前提取标量属性，避免后续 DB commit 导致实例属性过期
+        bridge_id = self.id or 1
+        bridge_self_id = self.self_id
+
         # UPSERT context_token（每条消息都可能更新该用户的 token）
         if msg.context_token:
             existing = await ContextToken.get(
                 session,
-                (col(ContextToken.user_name) == msg.from_user_id) & (col(ContextToken.bridge_id) == self.id),
+                (col(ContextToken.user_name) == msg.from_user_id) & (col(ContextToken.bridge_id) == bridge_id),
             )
             if existing is None:
                 _ = await ContextToken(
-                    bridge_id=self.id,
+                    bridge_id=bridge_id,
                     user_name=msg.from_user_id,
                     token=msg.context_token,
                 ).save(session, commit=commit)
@@ -808,6 +812,7 @@ class Bridge(
             session=session,
             msg=msg,
             id_registry=self.get_id_registry(),
+            self_id=bridge_self_id,
         )
 
     # ===== 出站消息处理（薄包装，委托 converters 模块） =====

@@ -107,7 +107,7 @@ class DatabaseManager:
         cls._session_factory = async_sessionmaker(
             cls.engine,
             class_=AsyncSession,
-            expire_on_commit=True,
+            expire_on_commit=False,
         )
 
         # 应用 Alembic 迁移到最新版本
