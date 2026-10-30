@@ -524,9 +524,11 @@ class Bridge(
             (col(ContextToken.user_name) == user_id) & (col(ContextToken.bridge_id) == self.id),
         )
         if context_token_row is None:
-            context_token_row = await ContextToken.get(
-                session, col(ContextToken.user_name) == user_id,
-            )
+            all_active = await Bridge.get_all_active(session)
+            if len(all_active) <= 1:
+                context_token_row = await ContextToken.get(
+                    session, col(ContextToken.user_name) == user_id,
+                )
         if context_token_row is None:
             raise ILinkContextTokenMissingError(user_id)
 
@@ -547,11 +549,19 @@ class Bridge(
             item_list=[item],
         )
         request = SendMessageRequest(msg=msg, base_info=self._build_base_info())
+        l.info(
+            f"Bridge '{self.account_name}' (self_id={self.self_id}) 发送文本消息: "
+            f"to={user_id}, content={content[:30]}..."
+        )
         # SendMessageResp 是空 body；用其 ret/errcode 状态判断
         _ = await self._post_ilink(
             ILINK_ENDPOINT_SENDMESSAGE,
             body=request,
             response_model=SendMessageResponse,
+        )
+        l.success(
+            f"Bridge '{self.account_name}' (self_id={self.self_id}) 文本消息已成功发出: "
+            f"client_id={msg.client_id}"
         )
         # iLink sendmessage 响应不返回 message_id，调用方据此理解为"成功标志"
         return None
@@ -582,9 +592,11 @@ class Bridge(
             (col(ContextToken.user_name) == user_id) & (col(ContextToken.bridge_id) == self.id),
         )
         if context_token_row is None:
-            context_token_row = await ContextToken.get(
-                session, col(ContextToken.user_name) == user_id,
-            )
+            all_active = await Bridge.get_all_active(session)
+            if len(all_active) <= 1:
+                context_token_row = await ContextToken.get(
+                    session, col(ContextToken.user_name) == user_id,
+                )
         if context_token_row is None:
             raise ILinkContextTokenMissingError(user_id)
 
@@ -608,10 +620,18 @@ class Bridge(
             item_list=item_list,
         )
         request = SendMessageRequest(msg=msg, base_info=self._build_base_info())
+        l.info(
+            f"Bridge '{self.account_name}' (self_id={self.self_id}) 发送媒体消息: "
+            f"to={user_id}, type={media_file.item_type.name}, file={media_file.file_name}"
+        )
         _ = await self._post_ilink(
             ILINK_ENDPOINT_SENDMESSAGE,
             body=request,
             response_model=SendMessageResponse,
+        )
+        l.success(
+            f"Bridge '{self.account_name}' (self_id={self.self_id}) 媒体消息已成功发出: "
+            f"client_id={msg.client_id}"
         )
 
     async def get_upload_url(
@@ -829,30 +849,47 @@ class Bridge(
         """
         反查 OneBot user_id 对应的 iLink user_id。
 
-        SHA-256 截断哈希是单向的，必须曾经被 ``resolve_user_id`` 处理过才能反查。
-        逻辑：先查内存缓存，未命中则扫描 ContextToken 表逐行 hash 填充并反查。
+        仅当该用户在当前 Bridge 账号下存在有效的 context_token 时才返回对应的 iLink user_id；
+        若该用户不属于当前 Bridge，返回 None。
         """
         registry = self.get_id_registry()
-        cached = registry.lookup_user_name_cached(onebot_user_id)
-        if cached is not None:
-            return cached
+        user_name = registry.lookup_user_name_cached(onebot_user_id)
 
-        all_tokens = await ContextToken.get(
-            session,
-            col(ContextToken.bridge_id) == self.id,
-            fetch_mode='all',
-        )
-        if not all_tokens:
+        if user_name is None:
+            my_tokens = await ContextToken.get(
+                session,
+                col(ContextToken.bridge_id) == self.id,
+                fetch_mode='all',
+            )
+            if my_tokens:
+                for row in my_tokens:
+                    _ = registry.resolve_user_id(row.user_name)
+            user_name = registry.lookup_user_name_cached(onebot_user_id)
+
+        if user_name is None:
             all_tokens = await ContextToken.get(session, fetch_mode='all')
-        if all_tokens is None:
-            return None
-        for row in all_tokens:
-            registry.resolve_user_id(row.user_name)
-            name = registry.lookup_user_name_cached(onebot_user_id)
-            if name is not None:
-                return name
+            if all_tokens:
+                for row in all_tokens:
+                    _ = registry.resolve_user_id(row.user_name)
+            user_name = registry.lookup_user_name_cached(onebot_user_id)
 
-        return registry.lookup_user_name_cached(onebot_user_id)
+        if user_name is None:
+            return None
+
+        # 检查该 user_name 是否属于当前 Bridge
+        if self.id is not None:
+            token = await ContextToken.get(
+                session,
+                (col(ContextToken.user_name) == user_name) & (col(ContextToken.bridge_id) == self.id),
+            )
+            if token is not None:
+                return user_name
+
+        all_active = await Bridge.get_all_active(session)
+        if len(all_active) <= 1:
+            return user_name
+
+        return None
 
     async def handle_outbound_send_message(
         self,

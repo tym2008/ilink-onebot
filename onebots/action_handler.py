@@ -273,8 +273,11 @@ async def handle_get_friend_list(
         fetch_mode='all',
     )
     if not tokens:
-        # 兼容单账号时期历史数据或全量查询
-        tokens = await ContextToken.get(session, fetch_mode='all')
+        from sqlmodels.bridge.bridge import Bridge
+        all_active = await Bridge.get_all_active(session)
+        if len(all_active) <= 1:
+            # 兼容单账号时期历史数据或全量查询
+            tokens = await ContextToken.get(session, fetch_mode='all')
 
     friends: list[dict[str, Any]] = []
     if tokens is not None:
@@ -470,6 +473,39 @@ async def _resolve_target_bridge(
     if isinstance(action.params, dict):
         raw_user_id = action.params.get('user_id')
         if raw_user_id is not None:
+            # 1. 查找此 onebot_user_id 对应的微信 user_name
+            id_registry = Bridge.get_id_registry()
+            user_name = id_registry.lookup_user_name_cached(raw_user_id)
+            if user_name is None:
+                all_tokens = await ContextToken.get(session, fetch_mode='all')
+                if all_tokens:
+                    for tok in all_tokens:
+                        if id_registry.resolve_user_id(tok.user_name) == raw_user_id:
+                            user_name = tok.user_name
+                            break
+            if user_name is not None:
+                # 2. 查询此 user_name 的所有 ContextToken，按最近活跃时间倒序
+                tokens = await ContextToken.get(
+                    session,
+                    col(ContextToken.user_name) == user_name,
+                    fetch_mode='all',
+                )
+                if tokens:
+                    tokens_sorted = sorted(
+                        tokens,
+                        key=lambda t: t.updated_at or t.created_at,
+                        reverse=True,
+                    )
+                    for tok in tokens_sorted:
+                        b = await Bridge.get(session, col(Bridge.id) == tok.bridge_id)
+                        if b is not None and b.bot_token is not None:
+                            l.info(
+                                f"通过 user_id={raw_user_id} ({user_name}) 的 context_token 路由到 "
+                                f"Bridge '{b.account_name}' (self_id={b.self_id})"
+                            )
+                            return b
+
+            # 兜底：若 ContextToken 暂无匹配，尝试让每个 active_bridge 反查
             active_bridges = await Bridge.get_all_active(session)
             for b in active_bridges:
                 matched_ilink_user = await b.resolve_user_id_from_onebot(session, raw_user_id)

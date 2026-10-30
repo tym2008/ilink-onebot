@@ -205,3 +205,73 @@ async def test_action_routing_by_self_id_and_user_id(test_session_factory):
         resp2 = await dispatch_action(b1, test_session_factory, config, action_send)
         assert resp2.retcode == 0
         mock_send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_second_account_image_sending_routes_to_second_bot(test_session_factory):
+    """测试第二个账号出站发送图片时，必须正确路由到第二个账号并调用其专属 send_media"""
+    from sqlmodels.media_file.media_file import MediaFile
+
+    async with test_session_factory() as session:
+        b1 = await Bridge.get_by_name(session, 'default')
+        assert b1 is not None
+        b1.bot_token = "token_b1"
+        b1.self_id = 10000
+        b1.state = BridgeStateEnum.running
+        await b1.save(session)
+
+        b2 = Bridge(account_name='bot2', self_id=10001, bot_token="token_b2", state=BridgeStateEnum.running)
+        b2 = await b2.save(session)
+        assert b2.id is not None
+
+        # 仅为 bot2 写入 context_token（模拟用户向 bot2 发送消息）
+        ct = ContextToken(bridge_id=b2.id, user_name="wx_user_bot2_img", token="ctx_token_b2")
+        await ct.save(session)
+
+        config = await ServerConfig.get_instance(session)
+
+    reg = b2.get_id_registry()
+    onebot_uid = reg.resolve_user_id("wx_user_bot2_img")
+
+    # 构造发送图片的 OneBot Action
+    action_image = OneBotAction(
+        action="send_msg",
+        params={
+            "user_id": onebot_uid,
+            "message": [
+                {
+                    "type": "image",
+                    "data": {"file": "base64://aGVsbG8="},  # 模拟 base64 图片
+                }
+            ],
+        },
+        echo="test_img_echo",
+    )
+
+    called_send_media_bridges: list[Bridge] = []
+
+    async def mock_send_media(self, *args, **kwargs):
+        called_send_media_bridges.append(self)
+
+    with (
+        patch.object(MediaFile, "prepare_and_upload", new_callable=AsyncMock) as mock_prepare,
+        patch.object(Bridge, "send_media", mock_send_media),
+    ):
+        mock_prepare.return_value = None
+
+        resp = await dispatch_action(b1, test_session_factory, config, action_image)
+        assert resp.retcode == 0
+
+        # 关键断言 1：prepare_and_upload 必须使用 bot2 实例，而不是 b1
+        mock_prepare.assert_awaited_once()
+        assert mock_prepare.await_args is not None
+        called_bridge = mock_prepare.await_args.args[0]
+        assert called_bridge.id == b2.id
+        assert called_bridge.account_name == 'bot2'
+        assert called_bridge.bot_token == 'token_b2'
+
+        # 关键断言 2：send_media 必须由 bot2 实例执行
+        assert len(called_send_media_bridges) == 1
+        assert called_send_media_bridges[0].id == b2.id
+        assert called_send_media_bridges[0].account_name == 'bot2'
+

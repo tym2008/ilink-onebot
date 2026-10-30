@@ -81,11 +81,11 @@ class OneBotWSClient:
     此类永不实例化。通过 ``start(url, ...)`` 启动后台连接循环，``stop()`` 终止。
     """
 
-    _task: ClassVar[asyncio.Task[None] | None] = None
-    """后台连接 + 重连循环任务"""
+    _tasks: ClassVar[dict[int, asyncio.Task[None]]] = {}
+    """每个 self_id 对应的后台连接 + 重连循环任务"""
 
-    _connection: ClassVar[ClientConnection | None] = None
-    """当前活动连接（None 表示未连接 / 重连中）"""
+    _connections: ClassVar[dict[int, ClientConnection]] = {}
+    """每个 self_id 对应的当前活动连接"""
 
     _action_callback: ClassVar[ActionCallback | None] = None
     """处理入站动作的回调（由 ``typers/run.py`` 在启动前注册）"""
@@ -97,7 +97,7 @@ class OneBotWSClient:
     """目标反向 WS URL"""
 
     _self_id: ClassVar[int | None] = None
-    """本桥接的 OneBot self_id（作为 X-Self-ID 头）"""
+    """本桥接默认的 OneBot self_id（备用）"""
 
     _access_token: ClassVar[str | None] = None
     """可选 Bearer token（与 server 模式共享同一份 ``meta_config.ONEBOT_ACCESS_TOKEN``）"""
@@ -126,100 +126,106 @@ class OneBotWSClient:
         access_token: str | None = None,
     ) -> None:
         """
-        启动后台连接 + 重连循环。
+        启动后台连接 + 重连循环（多账号并发多连接）。
 
         :param url: 目标反向 WS URL（``ws://`` 或 ``wss://``）
-        :param self_id: 本桥接的 OneBot self_id（作为 ``X-Self-ID`` 头）
+        :param self_id: 本桥接的 OneBot self_id（作为兜底 ``X-Self-ID`` 头）
         :param access_token: 可选 Bearer token；若框架配置了 ``access_token`` 校验须填
         """
-        if cls._task is not None:
-            l.warning("OneBotWSClient 已在运行，幂等返回")
-            return
-
         cls._url = url
         cls._self_id = self_id
         cls._access_token = access_token
         cls._stopping = False
-        cls._task = asyncio.create_task(cls._connect_loop())  # pyright: ignore[reportAttributeAccessIssue]
-        l.success(f"OneBot v11 反向 WS 客户端已启动: {url}")
+
+        from sqlmodels.bridge.bridge import Bridge
+        target_self_ids: list[int] = []
+        if cls._session_factory is not None:
+            async with cls._session_factory() as session:
+                active_bridges = await Bridge.get_all_active(session)
+                target_self_ids = [b.self_id for b in active_bridges]
+
+        if not target_self_ids:
+            target_self_ids = [self_id]
+
+        for sid in target_self_ids:
+            existing = cls._tasks.get(sid)
+            if existing is not None and not existing.done():
+                continue
+            cls._tasks[sid] = asyncio.create_task(cls._connect_loop(sid))
+            l.success(f"OneBot v11 反向 WS 客户端已启动 (self_id={sid}): {url}")
 
     @classmethod
     async def stop(cls) -> None:
         """
-        优雅关闭：取消重连循环，关闭当前连接（如有）。
+        优雅关闭：取消所有重连循环，关闭所有连接。
         """
-        if cls._task is None:
-            return
-
         cls._stopping = True
-        connection = cls._connection
-        if connection is not None:
+        for conn in list(cls._connections.values()):
             try:
-                await connection.close()
-            except Exception as e:  # noqa: BLE001 — close 阶段任何错都该 swallow + log，不影响后续 cleanup
+                await conn.close()
+            except Exception as e:  # noqa: BLE001
                 l.warning(f"关闭反向 WS 连接时出错（已忽略）: {type(e).__name__}: {e}")
+        cls._connections.clear()
 
-        _ = cls._task.cancel()
-        try:
-            await cls._task
-        except asyncio.CancelledError:
-            pass
-        cls._task = None  # pyright: ignore[reportAttributeAccessIssue]
-        cls._connection = None  # pyright: ignore[reportAttributeAccessIssue]
+        for task in list(cls._tasks.values()):
+            task.cancel()
+        if cls._tasks:
+            _ = await asyncio.gather(*cls._tasks.values(), return_exceptions=True)
+        cls._tasks.clear()
         l.info("OneBot v11 反向 WS 客户端已停止")
 
     @classmethod
     async def broadcast_event(cls, event: OneBotEventBase) -> None:
         """
-        向当前活动连接 push 事件。
-
-        未连接（``_connection is None`` 或已关闭）时静默返回——客户端模式下断线
-        是协议层的正常状态（连接重建后下一条事件会自然送达）。
+        向当前活动连接 push 事件。若事件指定了 self_id，优先路由到该账号的专属连接。
         """
-        connection = cls._connection
-        if connection is None:
+        payload = orjson.dumps(event.model_dump(exclude_none=True))
+        target_self_id = getattr(event, 'self_id', None)
+        target_conns: list[ClientConnection] = []
+        if target_self_id is not None and target_self_id in cls._connections:
+            target_conns = [cls._connections[target_self_id]]
+        else:
+            target_conns = list(cls._connections.values())
+
+        if not target_conns:
             l.debug(f"反向 WS 未连接，事件未 push: post_type={event.post_type}")
             return
-        payload = orjson.dumps(event.model_dump(exclude_none=True))
-        try:
-            await connection.send(payload)
-            l.debug(
-                f"反向 WS 已 push 事件: post_type={event.post_type}, "
-                f"payload={payload.decode('utf-8', errors='replace')[:400]}"
-            )
-        except ConnectionClosed:
-            l.warning("反向 WS 连接已关闭，事件 push 失败（等待重连）")
+
+        for conn in target_conns:
+            try:
+                await conn.send(payload)
+                l.debug(
+                    f"反向 WS 已 push 事件: post_type={event.post_type}, "
+                    f"payload={payload.decode('utf-8', errors='replace')[:400]}"
+                )
+            except ConnectionClosed:
+                l.warning("反向 WS 连接已关闭，事件 push 失败（等待重连）")
 
     # ===== 内部：连接 + 重连循环 =====
 
     @classmethod
-    async def _connect_loop(cls) -> None:
+    async def _connect_loop(cls, self_id: int) -> None:
         """
-        后台主循环：连接 → 消费消息 → 断开 → 退避 → 重连，直到 stop。
-
-        每次进入连接尝试，``delay`` 从 ``_RECONNECT_INITIAL_DELAY_SECONDS`` 开始；
-        每次连接失败 / 异常断开后翻倍直到 ``_RECONNECT_MAX_DELAY_SECONDS`` 上限。
-        成功握手后 ``delay`` 重置为初始值。
+        单个 self_id 的后台主循环：连接 → 消费消息 → 断开 → 退避 → 重连，直到 stop。
         """
-        if cls._url is None or cls._self_id is None:
+        if cls._url is None:
             raise RuntimeError("OneBotWSClient.start 必须先于 _connect_loop 调用")
 
         delay = _RECONNECT_INITIAL_DELAY_SECONDS
         try:
             while not cls._stopping:
                 try:
-                    await cls._connect_once()
-                    # 正常退出（连接被对端关闭）：重置退避后立即重连
+                    await cls._connect_once(self_id)
                     delay = _RECONNECT_INITIAL_DELAY_SECONDS
                     if cls._stopping:
                         break
-                    l.warning(f"反向 WS 对端断开，{delay:.1f}s 后重连")
+                    l.warning(f"反向 WS 对端断开 (self_id={self_id})，{delay:.1f}s 后重连")
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     raise
                 except (OSError, asyncio.TimeoutError, ConnectionClosed, InvalidStatus) as e:
                     l.warning(
-                        f"反向 WS 连接 / 通信失败: {type(e).__name__}: {e}，"
+                        f"反向 WS 连接 / 通信失败 (self_id={self_id}): {type(e).__name__}: {e}，"
                         f"{delay:.1f}s 后重试"
                     )
                     await asyncio.sleep(delay)
@@ -228,18 +234,15 @@ class OneBotWSClient:
             raise
 
     @classmethod
-    async def _connect_once(cls) -> None:
+    async def _connect_once(cls, self_id: int) -> None:
         """
-        建立一次连接，进入读循环消费 action 请求。
-
-        正常返回 = 对端关闭连接（应自动重连）。
-        异常抛出 = 连接 / 通信错误（让外层退避后重连）。
+        为指定 self_id 建立一次连接，进入读循环消费 action 请求。
         """
-        assert cls._url is not None and cls._self_id is not None  # checked in _connect_loop
+        assert cls._url is not None
 
         headers: dict[str, str] = {
             'User-Agent': DEFAULT_USER_AGENT,
-            HEADER_SELF_ID: str(cls._self_id),
+            HEADER_SELF_ID: str(self_id),
             HEADER_CLIENT_ROLE: CLIENT_ROLE_UNIVERSAL,
         }
         if cls._access_token is not None:
@@ -252,97 +255,71 @@ class OneBotWSClient:
             open_timeout=_OPEN_TIMEOUT_SECONDS,
             max_size=meta_config.ONEBOT_WS_MAX_SIZE,
         ) as connection:
-            cls._connection = connection  # pyright: ignore[reportAttributeAccessIssue]
-            l.success(f"反向 WS 已连接: {cls._url}")
+            cls._connections[self_id] = connection
+            l.success(f"反向 WS 已连接 (self_id={self_id}): {cls._url}")
             try:
-                await cls._send_bootstrap_events(connection)
-                await cls._consume_messages(connection)
+                await cls._send_bootstrap_events(connection, self_id)
+                await cls._consume_messages(connection, self_id)
             finally:
-                cls._connection = None  # pyright: ignore[reportAttributeAccessIssue]
+                cls._connections.pop(self_id, None)
 
     @classmethod
-    async def _send_bootstrap_events(cls, connection: ClientConnection) -> None:
+    async def _send_bootstrap_events(cls, connection: ClientConnection, self_id: int) -> None:
         """
-        连接建立后立即发送 OneBot v11 bootstrap 元事件。
-
-        按 OneBot 规范和常见框架（如 TRSS-Yunzai / NoneBot2）预期，依次针对每个
-        已就绪账号发送：
-        1. lifecycle: connect
-        2. lifecycle: enable
-        3. heartbeat（附带当前状态）
-        并在动作分发器中推入待匹配队列，确保框架随后发送的 get_login_info 能正确定位账号。
+        连接建立后立即发送当前 self_id 的 OneBot v11 bootstrap 元事件。
         """
-        from sqlmodels.bridge.bridge import Bridge
-
-        active_bridges: list[Bridge] = []
-        if cls._session_factory is not None:
-            async with cls._session_factory() as session:
-                active_bridges = await Bridge.get_all_active(session)
-
-        # 若无活跃账号配置，回退到启动参数注入的 self_id
-        target_self_ids: list[int] = (
-            [b.self_id for b in active_bridges]
-            if active_bridges
-            else ([cls._self_id] if cls._self_id is not None else [])
-        )
-
-        for self_id in target_self_ids:
-            push_pending_bootstrap_self_id(self_id)
-            now = int(time.time())
-            events = [
-                OneBotMetaEvent(
-                    time=now,
-                    self_id=self_id,
-                    post_type=OneBotPostTypeEnum.meta_event,
-                    meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
-                    sub_type=OneBotLifecycleSubTypeEnum.connect,
-                    status=OneBotHeartbeatStatus(online=True, good=True),
-                ),
-                OneBotMetaEvent(
-                    time=now,
-                    self_id=self_id,
-                    post_type=OneBotPostTypeEnum.meta_event,
-                    meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
-                    sub_type=OneBotLifecycleSubTypeEnum.enable,
-                    status=OneBotHeartbeatStatus(online=True, good=True),
-                ),
-                OneBotMetaEvent(
-                    time=now,
-                    self_id=self_id,
-                    post_type=OneBotPostTypeEnum.meta_event,
-                    meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
-                    interval=15000,
-                    status=OneBotHeartbeatStatus(online=True, good=True),
-                ),
-            ]
-            for event in events:
-                payload = orjson.dumps(event.model_dump(exclude_none=True))
-                await connection.send(payload)
-                l.debug(
-                    f"反向 WS 已发送 bootstrap 事件 (self_id={self_id}): {event.meta_event_type}."
-                    f"{event.sub_type or 'heartbeat'}"
-                )
-            # 账号间微小间隔，给框架异步初始化留出事件循环调度缝隙
-            await asyncio.sleep(0.05)
+        push_pending_bootstrap_self_id(self_id)
+        now = int(time.time())
+        events = [
+            OneBotMetaEvent(
+                time=now,
+                self_id=self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                sub_type=OneBotLifecycleSubTypeEnum.connect,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+            OneBotMetaEvent(
+                time=now,
+                self_id=self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                sub_type=OneBotLifecycleSubTypeEnum.enable,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+            OneBotMetaEvent(
+                time=now,
+                self_id=self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
+                interval=15000,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+        ]
+        for event in events:
+            payload = orjson.dumps(event.model_dump(exclude_none=True))
+            await connection.send(payload)
+            l.debug(
+                f"反向 WS 已发送 bootstrap 事件 (self_id={self_id}): {event.meta_event_type}."
+                f"{event.sub_type or 'heartbeat'}"
+            )
 
     @classmethod
-    async def _consume_messages(cls, connection: ClientConnection) -> None:
+    async def _consume_messages(cls, connection: ClientConnection, self_id: int) -> None:
         """
         读循环：从连接接收 OneBot action 请求，调回调，发回响应。
-
-        所有错误都包装为 ``OneBotActionResponse.failed`` 返回，让单条非法消息不
-        断开连接；只有 ``ConnectionClosed`` 会让循环退出（外层据此重连）。
         """
         async for raw in connection:
             if isinstance(raw, bytes):
                 raw = raw.decode('utf-8')
-            await cls._handle_incoming_message(connection, raw)
+            await cls._handle_incoming_message(connection, raw, self_id)
 
     @classmethod
     async def _handle_incoming_message(
         cls,
         connection: ClientConnection,
         raw: str,
+        self_id: int,
     ) -> None:
         """
         处理一条入站消息（OneBot action 请求）：反序列化 → 回调 → 序列化响应。
@@ -357,7 +334,7 @@ class OneBotWSClient:
 
         try:
             action = OneBotAction.model_validate(data)
-        except Exception as e:  # noqa: BLE001 — pydantic 校验失败种类多，统一拦
+        except Exception as e:  # noqa: BLE001
             l.warning(f"反向 WS 收到非法动作请求: {e}")
             echo = data.get('echo') if isinstance(data, dict) else None
             response = OneBotActionResponse.failed(
@@ -366,6 +343,12 @@ class OneBotWSClient:
             )
             await connection.send(orjson.dumps(response.model_dump(exclude_none=True)))
             return
+
+        # 标记当前连接专属的 self_id，保证动作精准由对应账号执行
+        if action.self_id is None:
+            action.self_id = self_id
+        if isinstance(action.params, dict) and 'self_id' not in action.params:
+            action.params['self_id'] = self_id
 
         if cls._action_callback is None:
             l.error("OneBotWSClient 未注册 action_callback，无法处理入站动作")
