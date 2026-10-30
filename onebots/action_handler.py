@@ -18,11 +18,14 @@ OneBot v11 动作分发器（薄分发层）
 
 不支持的动作统一返回 `retcode=1404`（NOT_FOUND）。
 """
+from __future__ import annotations
+
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger as l
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlmodel import col
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from meta_config import meta_config
@@ -37,13 +40,12 @@ from onebots.models import (
     OneBotRetCodeEnum,
     OneBotSegment,
 )
-from sqlmodels.bridge import Bridge
 from sqlmodels.bridge.context_token import ContextToken
 from sqlmodels.bridge.enums import BridgeStateEnum
 from sqlmodels.server_config import ServerConfig
 
 if TYPE_CHECKING:
-    pass
+    from sqlmodels.bridge.bridge import Bridge
 
 
 # 单个动作的处理函数签名：接收 (bridge, session, config, action) 返回 OneBotActionResponse
@@ -51,9 +53,26 @@ if TYPE_CHECKING:
 # - 调用方在外层已经获取了这些对象，避免重复查询
 # - 便于测试时注入 mock
 ActionHandler = Callable[
-    [Bridge, AsyncSession, ServerConfig, OneBotAction],
+    ['Bridge', AsyncSession, ServerConfig, OneBotAction],
     Awaitable[OneBotActionResponse],
 ]
+
+
+# ===== 握手队列（用于多账号连接时将无 self_id 的 get_login_info 顺序映射到对应账号） =====
+
+_pending_bootstrap_self_ids: list[int] = []
+
+
+def push_pending_bootstrap_self_id(self_id: int) -> None:
+    """记录刚刚发送了 bootstrap lifecycle 的 self_id，供后续 get_login_info 匹配"""
+    _pending_bootstrap_self_ids.append(self_id)
+
+
+def pop_pending_bootstrap_self_id() -> int | None:
+    """提取最早待获取 login_info 的 self_id"""
+    if _pending_bootstrap_self_ids:
+        return _pending_bootstrap_self_ids.pop(0)
+    return None
 
 
 # ===== 单个动作处理函数 =====
@@ -72,13 +91,14 @@ async def handle_get_login_info(
 
     nickname 优先使用 ServerConfig.bot_display_name（管理员可配置），
     回退到 Bridge.wechat_nickname（登录后由 iLink 返回的真实昵称）。
+    user_id 使用当前 Bridge 的 self_id（支持多账号各自上报）。
     """
     nickname = config.bot_display_name
     if not nickname and bridge.wechat_nickname is not None:
         nickname = bridge.wechat_nickname
     return OneBotActionResponse.ok(
         data={
-            'user_id': meta_config.ONEBOT_SELF_ID,
+            'user_id': bridge.self_id,
             'nickname': nickname,
         },
         echo=action.echo,
@@ -257,11 +277,19 @@ async def handle_get_friend_list(
     """
     获取好友列表（OneBot v11 标准动作）。
 
-    从 ContextToken 表中查询已与 Bot 建立对话的联系人，转换为 OneBot 好友项列表。
+    从 ContextToken 表中查询已与当前 Bot 建立对话的联系人，转换为 OneBot 好友项列表。
     若无记录返回空列表，避免框架（如 TRSS-Yunzai）在初始化时抛异常中断。
     """
     registry = bridge.get_id_registry()
-    tokens = await ContextToken.get(session, fetch_mode='all')
+    tokens = await ContextToken.get(
+        session,
+        col(ContextToken.bridge_id) == bridge.id,
+        fetch_mode='all',
+    )
+    if not tokens:
+        # 兼容单账号时期历史数据或全量查询
+        tokens = await ContextToken.get(session, fetch_mode='all')
+
     friends: list[dict[str, Any]] = []
     if tokens is not None:
         for row in tokens:
@@ -417,6 +445,54 @@ action 名称到 handler 函数的映射。
 
 # ===== 分发入口 =====
 
+async def _resolve_target_bridge(
+    session: AsyncSession,
+    default_bridge: 'Bridge',
+    action: OneBotAction,
+) -> 'Bridge':
+    """
+    解析当前 action 应交由哪个 Bridge 账号执行。
+
+    路由规则（优先级从高到低）：
+    1. action.self_id 或 action.params.get('self_id')：框架显式指定目标账号
+    2. action.action == 'get_login_info' 且无 self_id：从待匹配 bootstrap 队列中提取
+    3. action.params.get('user_id')：根据目标 OneBot user_id 反查属于哪个 Bridge 的上下文
+    4. 回退：default_bridge
+    """
+    from sqlmodels.bridge.bridge import Bridge
+    target_self_id = getattr(action, 'self_id', None)
+    if target_self_id is None and isinstance(action.params, dict):
+        raw_self_id = action.params.get('self_id')
+        if raw_self_id is not None:
+            try:
+                target_self_id = int(raw_self_id)
+            except (ValueError, TypeError):
+                pass
+
+    if target_self_id is not None:
+        b = await Bridge.get_by_self_id(session, target_self_id)
+        if b is not None:
+            return b
+
+    if action.action == 'get_login_info':
+        queued_self_id = pop_pending_bootstrap_self_id()
+        if queued_self_id is not None:
+            b = await Bridge.get_by_self_id(session, queued_self_id)
+            if b is not None:
+                return b
+
+    if isinstance(action.params, dict):
+        raw_user_id = action.params.get('user_id')
+        if raw_user_id is not None:
+            active_bridges = await Bridge.get_all_active(session)
+            for b in active_bridges:
+                matched_ilink_user = await b.resolve_user_id_from_onebot(session, raw_user_id)
+                if matched_ilink_user is not None:
+                    return b
+
+    return default_bridge
+
+
 async def dispatch_action(
     bridge: Bridge,
     session_factory: async_sessionmaker[AsyncSession],
@@ -427,11 +503,11 @@ async def dispatch_action(
     分发 OneBot v11 动作到对应的 handler，返回响应。
 
     每个动作打开独立的 AsyncSession，处理完即释放，避免长生命周期 session 占用连接。
-    Bridge 和 ServerConfig 单例由外层注入。
+    根据 action 参数智能路由到具体目标 Bridge。
 
-    :param bridge: Bridge 单例（在外层启动时加载，注入避免重复查询）
+    :param bridge: 默认 Bridge 实例
     :param session_factory: 数据库会话工厂
-    :param config: ServerConfig 单例（同上）
+    :param config: ServerConfig 单例
     :param action: OneBot 动作请求
     :return: OneBot 动作响应（始终返回，不抛异常）
     """
@@ -444,10 +520,13 @@ async def dispatch_action(
         )
 
     async with session_factory() as session:
+        target_bridge = await _resolve_target_bridge(session, bridge, action)
         try:
-            return await handler(bridge, session, config, action)
+            return await handler(target_bridge, session, config, action)
         except Exception as e:
-            l.exception(f"OneBot 动作 {action.action} 执行失败: {e}")
+            l.exception(
+                f"OneBot 动作 {action.action} 执行失败 (self_id={target_bridge.self_id}): {e}"
+            )
             return OneBotActionResponse.failed(
                 retcode=OneBotRetCodeEnum.BAD_REQUEST,
                 echo=action.echo,

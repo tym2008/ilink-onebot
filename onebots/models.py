@@ -270,6 +270,9 @@ class OneBotAction(ExtraIgnoreModelBase):
     params: dict[str, Any]
     """动作参数（不同 action 字段差异巨大，用 dict[str, Any] 承接）"""
 
+    self_id: int | None = None
+    """多账号场景下 OneBot 框架指定的目标 bot 虚拟 QQ 号（可选）"""
+
     echo: Any = None
     """
     回声字段（响应原样返回，用于异步请求的匹配）。

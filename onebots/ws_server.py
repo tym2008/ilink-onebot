@@ -21,19 +21,24 @@ OneBot v11 WebSocket 服务端（Reverse WS 服务端模式）
 
 :author: Foxerine <https://github.com/Foxerine>
 """
+from __future__ import annotations
+
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import parse_qs, urlparse
 
 import orjson
 from loguru import logger as l
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlmodel.ext.asyncio.session import AsyncSession
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
 from meta_config import meta_config
+from onebots.action_handler import push_pending_bootstrap_self_id
 from onebots.constants import BEARER_PREFIX, QUERY_ACCESS_TOKEN_KEY
 from onebots.models import (
     OneBotAction,
@@ -46,6 +51,9 @@ from onebots.models import (
     OneBotPostTypeEnum,
     OneBotRetCodeEnum,
 )
+
+if TYPE_CHECKING:
+    from sqlmodels.bridge.bridge import Bridge
 
 # 动作回调签名：接收 action，返回响应（异步）
 ActionCallback = Callable[[OneBotAction], Awaitable[OneBotActionResponse]]
@@ -91,6 +99,9 @@ class OneBotWSServer:
     _action_callback: ClassVar[ActionCallback | None] = None
     """处理入站动作的回调"""
 
+    _session_factory: ClassVar[async_sessionmaker[AsyncSession] | None] = None
+    """数据库会话工厂，用于握手时查询所有已就绪账号"""
+
     _self_id: ClassVar[int | None] = None
     """本桥接的 OneBot self_id（启动时由调用方传入，作为 X-Self-ID 头）"""
 
@@ -109,6 +120,11 @@ class OneBotWSServer:
         序列化后发回客户端。
         """
         cls._action_callback = callback
+
+    @classmethod
+    def set_session_factory(cls, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        """注册数据库会话工厂，用于动态探测所有已登录账号"""
+        cls._session_factory = session_factory
 
     @classmethod
     async def start(
@@ -259,43 +275,57 @@ class OneBotWSServer:
     async def _send_bootstrap_events(cls, connection: ServerConnection) -> None:
         """
         连接建立后向该客户端发送 bootstrap 元事件（connect / enable / heartbeat）。
+        按活跃账号依次发送，并在动作分发器中推入待匹配队列。
         """
-        if cls._self_id is None:
-            return
+        from sqlmodels.bridge.bridge import Bridge
 
-        now = int(time.time())
-        events = [
-            OneBotMetaEvent(
-                time=now,
-                self_id=cls._self_id,
-                post_type=OneBotPostTypeEnum.meta_event,
-                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
-                sub_type=OneBotLifecycleSubTypeEnum.connect,
-                status=OneBotHeartbeatStatus(online=True, good=True),
-            ),
-            OneBotMetaEvent(
-                time=now,
-                self_id=cls._self_id,
-                post_type=OneBotPostTypeEnum.meta_event,
-                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
-                sub_type=OneBotLifecycleSubTypeEnum.enable,
-                status=OneBotHeartbeatStatus(online=True, good=True),
-            ),
-            OneBotMetaEvent(
-                time=now,
-                self_id=cls._self_id,
-                post_type=OneBotPostTypeEnum.meta_event,
-                meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
-                interval=15000,
-                status=OneBotHeartbeatStatus(online=True, good=True),
-            ),
-        ]
-        for event in events:
-            payload = orjson.dumps(event.model_dump(exclude_none=True))
-            try:
-                await connection.send(payload)
-            except ConnectionClosed:
-                break
+        active_bridges: list[Bridge] = []
+        if cls._session_factory is not None:
+            async with cls._session_factory() as session:
+                active_bridges = await Bridge.get_all_active(session)
+
+        target_self_ids: list[int] = (
+            [b.self_id for b in active_bridges]
+            if active_bridges
+            else ([cls._self_id] if cls._self_id is not None else [])
+        )
+
+        for self_id in target_self_ids:
+            push_pending_bootstrap_self_id(self_id)
+            now = int(time.time())
+            events = [
+                OneBotMetaEvent(
+                    time=now,
+                    self_id=self_id,
+                    post_type=OneBotPostTypeEnum.meta_event,
+                    meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                    sub_type=OneBotLifecycleSubTypeEnum.connect,
+                    status=OneBotHeartbeatStatus(online=True, good=True),
+                ),
+                OneBotMetaEvent(
+                    time=now,
+                    self_id=self_id,
+                    post_type=OneBotPostTypeEnum.meta_event,
+                    meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                    sub_type=OneBotLifecycleSubTypeEnum.enable,
+                    status=OneBotHeartbeatStatus(online=True, good=True),
+                ),
+                OneBotMetaEvent(
+                    time=now,
+                    self_id=self_id,
+                    post_type=OneBotPostTypeEnum.meta_event,
+                    meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
+                    interval=15000,
+                    status=OneBotHeartbeatStatus(online=True, good=True),
+                ),
+            ]
+            for event in events:
+                payload = orjson.dumps(event.model_dump(exclude_none=True))
+                try:
+                    await connection.send(payload)
+                except ConnectionClosed:
+                    return
+            await asyncio.sleep(0.05)
 
     @classmethod
     async def _handle_incoming_message(

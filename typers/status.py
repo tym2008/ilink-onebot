@@ -21,16 +21,18 @@ async def _status_impl() -> None:
     """异步状态查询主流程"""
     async with infra_lifespan() as session_factory:
         async with session_factory() as session:
-            bridge = await Bridge.get_instance(session)
+            bridges = await Bridge.get_all(session)
             config = await ServerConfig.get_instance(session)
             media_count = await MediaFile.count(session)
 
-        typer.echo("=== iLink Bridge 状态 ===")
-        typer.echo(f"  state          : {bridge.state}")
-        typer.echo(f"  wechat_id      : {bridge.wechat_id or '<未登录>'}")
-        typer.echo(f"  wechat_nickname: {bridge.wechat_nickname or '<未登录>'}")
-        typer.echo(f"  bot_token      : {'<已设置>' if bridge.bot_token else '<未设置>'}")
-        typer.echo(f"  poll cursor    : {'<有>' if bridge.get_updates_buf else '<空>'}")
+        typer.echo(f"=== iLink Bridge 账号状态（共 {len(bridges)} 个）===")
+        for b in bridges:
+            typer.echo(f"  [{b.account_name}] (self_id={b.self_id}):")
+            typer.echo(f"    state          : {b.state}")
+            typer.echo(f"    wechat_id      : {b.wechat_id or '<未登录>'}")
+            typer.echo(f"    wechat_nickname: {b.wechat_nickname or '<未登录>'}")
+            typer.echo(f"    bot_token      : {'<已设置>' if b.bot_token else '<未设置>'}")
+            typer.echo(f"    poll cursor    : {'<有>' if b.get_updates_buf else '<空>'}")
 
         typer.echo("\n=== 运行配置（ServerConfig） ===")
         typer.echo(f"  bot_display_name           : {config.bot_display_name}")

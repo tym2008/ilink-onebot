@@ -20,8 +20,9 @@ iLink 协议要求：回复某用户时，`sendmessage` 请求必须携带该用
 CRUD 由 TableBaseMixin 提供；调用方直接使用 `ContextToken.get()` 查询、
 `ContextToken(...).save()` 插入或 `row.save()` 更新。本模块不重复封装那些方法。
 """
-from typing import Annotated
+from typing import Annotated, ClassVar
 
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field
 
 from sqlmodel_ext import SQLModelBase, Str256, Str512, TableBaseMixin
@@ -35,12 +36,15 @@ class ContextTokenBase(SQLModelBase):
 
     包含 table 模型和未来可能的 DTO 类共享的字段。
     """
-    user_name: Annotated[Str256, Field(unique=True, index=True)]
+    bridge_id: int = Field(default=1, index=True)
+    """所属 Bridge 账号 ID（默认 1，兼容单账号时期数据）"""
+
+    user_name: Annotated[Str256, Field(index=True)]
     """
     用户的 iLink user_id（``WeixinMessage.from_user_id`` / ``to_user_id``）。
 
     历史列名保留为 ``user_name``，但语义上存的就是 iLink 的不透明用户标识（一串字符串）。
-    unique=True + index=True 保证 UPSERT 的快速定位和幂等语义。
+    与 bridge_id 组成联合唯一索引。
     """
 
     token: Str512
@@ -56,7 +60,10 @@ class ContextToken(ContextTokenBase, TableBaseMixin, table=True):
     iLink 每用户 context_token 的持久化记录。
 
     纯数据表，所有 CRUD 能力继承自 TableBaseMixin：
-    - 查询：`ContextToken.get(session, col(ContextToken.user_name) == name)`
-    - 插入：`ContextToken(user_name=name, token=tok).save(session)`
+    - 查询：`ContextToken.get(session, col(ContextToken.user_name) == name, col(ContextToken.bridge_id) == bid)`
+    - 插入：`ContextToken(bridge_id=bid, user_name=name, token=tok).save(session)`
     - 更新：`row.token = new_tok; await row.save(session)`
     """
+    __table_args__: ClassVar[tuple[object, ...]] = (
+        UniqueConstraint('bridge_id', 'user_name', name='uq_contexttoken_bridge_user'),
+    )

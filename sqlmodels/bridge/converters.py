@@ -103,7 +103,7 @@ async def convert_inbound_message(
 
     return OneBotPrivateMessageEvent(
         time=create_time_seconds,
-        self_id=meta_config.ONEBOT_SELF_ID,
+        self_id=bridge.self_id,
         sub_type=OneBotPrivateSubTypeEnum.friend,
         message_id=onebot_message_id,
         user_id=onebot_user_id,

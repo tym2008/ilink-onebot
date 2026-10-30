@@ -27,7 +27,6 @@ from onebots.models import (
 )
 from onebots.ws_client import OneBotWSClient
 from onebots.ws_server import OneBotWSServer
-from sqlmodels.bridge import Bridge
 from sqlmodels.bridge.enums import BridgeStateEnum
 from sqlmodels.server_config import ServerConfig
 
@@ -78,24 +77,32 @@ class OneBotHeartbeat:
         每次循环都重新读 ServerConfig 和 Bridge 状态，让运行时配置变更立即生效。
         """
         try:
+            from sqlmodels.bridge.bridge import Bridge
+
             while True:
                 async with session_factory() as session:
                     config = await ServerConfig.get_instance(session)
-                    bridge = await Bridge.get_instance(session)
+                    active_bridges = await Bridge.get_all_active(session)
                     interval_seconds = config.heartbeat_interval_seconds
-                    online = bridge.state == BridgeStateEnum.running
 
-                event = OneBotMetaEvent(
-                    time=int(time.time()),
-                    self_id=meta_config.ONEBOT_SELF_ID,
-                    meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
-                    interval=interval_seconds * 1000,  # OneBot 规范要求毫秒
-                    status=OneBotHeartbeatStatus(online=online, good=online),
+                target_self_ids: list[tuple[int, bool]] = (
+                    [(b.self_id, b.state == BridgeStateEnum.running) for b in active_bridges]
+                    if active_bridges
+                    else [(meta_config.ONEBOT_SELF_ID, False)]
                 )
-                # 心跳同时发给 server 模式（被动监听的框架）和 client 模式
-                # （主动连出的框架），保证两边都能据此判断 bot 存活
-                await OneBotWSServer.broadcast_event(event)
-                await OneBotWSClient.broadcast_event(event)
+
+                now = int(time.time())
+                for self_id, online in target_self_ids:
+                    event = OneBotMetaEvent(
+                        time=now,
+                        self_id=self_id,
+                        meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
+                        interval=interval_seconds * 1000,  # OneBot 规范要求毫秒
+                        status=OneBotHeartbeatStatus(online=online, good=online),
+                    )
+                    await OneBotWSServer.broadcast_event(event)
+                    await OneBotWSClient.broadcast_event(event)
+
                 await asyncio.sleep(interval_seconds)
         except asyncio.CancelledError:
             # 优雅退出：在 stop() 被显式取消

@@ -117,18 +117,26 @@ async def _ensure_logged_in(session_factory: async_sessionmaker[AsyncSession]) -
     """
     启动前的登录状态守卫。
 
-    未登录或会话过期则提示用户先执行 login 后退出。
+    检查数据库中是否至少存在一个已就绪（active）的 Bridge 账号。
+    若全部未登录或已过期，则提示用户先执行 login 后退出。
     """
     async with session_factory() as session:
-        bridge = await Bridge.get_instance(session)
+        active_bridges = await Bridge.get_all_active(session)
+        all_bridges = await Bridge.get_all(session)
 
-    if bridge.state == BridgeStateEnum.idle or bridge.bot_token is None:
-        typer.echo("✗ 尚未登录，请先执行 `ilink-onebot login`")
+    if not all_bridges:
+        typer.echo("✗ 尚未登录任何账号，请先执行 `ilink-onebot login`")
         raise typer.Exit(code=1)
-    if bridge.state == BridgeStateEnum.expired:
-        typer.echo("✗ 会话已过期，请重新执行 `ilink-onebot login`")
+
+    if not active_bridges:
+        typer.echo("✗ 所有账号会话均已过期或未就绪，请重新执行 `ilink-onebot login [account] --force`")
         raise typer.Exit(code=1)
-    l.info(f"Bridge 已就绪: {bridge.wechat_nickname} ({bridge.wechat_id})")
+
+    for b in active_bridges:
+        l.info(
+            f"Bridge 账号已就绪: account='{b.account_name}', self_id={b.self_id}, "
+            f"nickname='{b.wechat_nickname}', wechat_id='{b.wechat_id}'"
+        )
 
 
 async def _run_impl() -> None:
@@ -137,16 +145,19 @@ async def _run_impl() -> None:
         # 1. 登录守卫
         await _ensure_logged_in(session_factory)
 
-        # 2. 注册 OneBot 动作回调（闭包捕获 session_factory，同一份 callback 同时
+        # 2. 注册 OneBot 动作回调与会话工厂（闭包捕获 session_factory，同一份 callback 同时
         # 提供给 server 模式（被动监听）和 client 模式（主动连框架））
         action_callback = _make_onebot_action_callback(session_factory)
         OneBotWSServer.set_action_callback(action_callback)
+        OneBotWSServer.set_session_factory(session_factory)
         OneBotWSClient.set_action_callback(action_callback)
+        OneBotWSClient.set_session_factory(session_factory)
 
-        # 3. 通知 iLink 服务端本客户端已启动（与官方 channel.ts 对齐，避免被误判离线）
+        # 3. 通知 iLink 服务端所有活跃客户端已启动（与官方 channel.ts 对齐，避免被误判离线）
         async with session_factory() as session:
-            bridge = await Bridge.get_instance(session)
-        await bridge.notify_start()
+            active_bridges = await Bridge.get_all_active(session)
+        for b in active_bridges:
+            await b.notify_start()
 
         # 4. 启动 OneBot WS 服务端（被动监听，让框架连过来）
         l.info("启动 OneBot v11 WS 服务端")
@@ -207,8 +218,9 @@ async def _run_impl() -> None:
 
         # 最后通知 iLink 服务端本客户端即将下线（best-effort）
         async with session_factory() as session:
-            bridge_for_stop = await Bridge.get_instance(session)
-        await bridge_for_stop.notify_stop()
+            bridges_for_stop = await Bridge.get_all_active(session)
+        for b in bridges_for_stop:
+            await b.notify_stop()
 
 
 @app.command()

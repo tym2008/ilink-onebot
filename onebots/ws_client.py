@@ -17,17 +17,22 @@ OneBot v11 WebSocket 客户端（Reverse WS 客户端模式）
 action 回调与 ``OneBotWSServer.set_action_callback`` 设的是同一份（``onebots/_event_dispatch`` 在
 ``typers/run.py`` 启动时把 callback 注册到两个 transport），保证两边收 action 行为一致。
 """
+from __future__ import annotations
+
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import orjson
 from loguru import logger as l
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlmodel.ext.asyncio.session import AsyncSession
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from meta_config import meta_config
+from onebots.action_handler import push_pending_bootstrap_self_id
 from onebots.constants import (
     CLIENT_ROLE_UNIVERSAL,
     DEFAULT_USER_AGENT,
@@ -45,6 +50,9 @@ from onebots.models import (
     OneBotPostTypeEnum,
     OneBotRetCodeEnum,
 )
+
+if TYPE_CHECKING:
+    from sqlmodels.bridge.bridge import Bridge
 
 
 # 与 ws_server 同一签名（注册到 server 和 client 的是同一个 callback 实例）
@@ -82,6 +90,9 @@ class OneBotWSClient:
     _action_callback: ClassVar[ActionCallback | None] = None
     """处理入站动作的回调（由 ``typers/run.py`` 在启动前注册）"""
 
+    _session_factory: ClassVar[async_sessionmaker[AsyncSession] | None] = None
+    """数据库会话工厂，用于握手时查询所有已就绪账号"""
+
     _url: ClassVar[str | None] = None
     """目标反向 WS URL"""
 
@@ -101,6 +112,11 @@ class OneBotWSClient:
     def set_action_callback(cls, callback: ActionCallback) -> None:
         """注册入站动作回调（在 start 之前调用）"""
         cls._action_callback = callback
+
+    @classmethod
+    def set_session_factory(cls, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        """注册数据库会话工厂，用于动态探测所有已登录账号"""
+        cls._session_factory = session_factory
 
     @classmethod
     async def start(
@@ -249,48 +265,65 @@ class OneBotWSClient:
         """
         连接建立后立即发送 OneBot v11 bootstrap 元事件。
 
-        按 OneBot 规范和常见框架（如 TRSS-Yunzai / NoneBot2）预期，依序发送：
+        按 OneBot 规范和常见框架（如 TRSS-Yunzai / NoneBot2）预期，依次针对每个
+        已就绪账号发送：
         1. lifecycle: connect
         2. lifecycle: enable
         3. heartbeat（附带当前状态）
+        并在动作分发器中推入待匹配队列，确保框架随后发送的 get_login_info 能正确定位账号。
         """
-        if cls._self_id is None:
-            return
+        from sqlmodels.bridge.bridge import Bridge
 
-        now = int(time.time())
-        events = [
-            OneBotMetaEvent(
-                time=now,
-                self_id=cls._self_id,
-                post_type=OneBotPostTypeEnum.meta_event,
-                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
-                sub_type=OneBotLifecycleSubTypeEnum.connect,
-                status=OneBotHeartbeatStatus(online=True, good=True),
-            ),
-            OneBotMetaEvent(
-                time=now,
-                self_id=cls._self_id,
-                post_type=OneBotPostTypeEnum.meta_event,
-                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
-                sub_type=OneBotLifecycleSubTypeEnum.enable,
-                status=OneBotHeartbeatStatus(online=True, good=True),
-            ),
-            OneBotMetaEvent(
-                time=now,
-                self_id=cls._self_id,
-                post_type=OneBotPostTypeEnum.meta_event,
-                meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
-                interval=15000,
-                status=OneBotHeartbeatStatus(online=True, good=True),
-            ),
-        ]
-        for event in events:
-            payload = orjson.dumps(event.model_dump(exclude_none=True))
-            await connection.send(payload)
-            l.debug(
-                f"反向 WS 已发送 bootstrap 事件: {event.meta_event_type}."
-                f"{event.sub_type or 'heartbeat'}"
-            )
+        active_bridges: list[Bridge] = []
+        if cls._session_factory is not None:
+            async with cls._session_factory() as session:
+                active_bridges = await Bridge.get_all_active(session)
+
+        # 若无活跃账号配置，回退到启动参数注入的 self_id
+        target_self_ids: list[int] = (
+            [b.self_id for b in active_bridges]
+            if active_bridges
+            else ([cls._self_id] if cls._self_id is not None else [])
+        )
+
+        for self_id in target_self_ids:
+            push_pending_bootstrap_self_id(self_id)
+            now = int(time.time())
+            events = [
+                OneBotMetaEvent(
+                    time=now,
+                    self_id=self_id,
+                    post_type=OneBotPostTypeEnum.meta_event,
+                    meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                    sub_type=OneBotLifecycleSubTypeEnum.connect,
+                    status=OneBotHeartbeatStatus(online=True, good=True),
+                ),
+                OneBotMetaEvent(
+                    time=now,
+                    self_id=self_id,
+                    post_type=OneBotPostTypeEnum.meta_event,
+                    meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                    sub_type=OneBotLifecycleSubTypeEnum.enable,
+                    status=OneBotHeartbeatStatus(online=True, good=True),
+                ),
+                OneBotMetaEvent(
+                    time=now,
+                    self_id=self_id,
+                    post_type=OneBotPostTypeEnum.meta_event,
+                    meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
+                    interval=15000,
+                    status=OneBotHeartbeatStatus(online=True, good=True),
+                ),
+            ]
+            for event in events:
+                payload = orjson.dumps(event.model_dump(exclude_none=True))
+                await connection.send(payload)
+                l.debug(
+                    f"反向 WS 已发送 bootstrap 事件 (self_id={self_id}): {event.meta_event_type}."
+                    f"{event.sub_type or 'heartbeat'}"
+                )
+            # 账号间微小间隔，给框架异步初始化留出事件循环调度缝隙
+            await asyncio.sleep(0.05)
 
     @classmethod
     async def _consume_messages(cls, connection: ClientConnection) -> None:

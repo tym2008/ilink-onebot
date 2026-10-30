@@ -159,6 +159,12 @@ class BridgeBase(SQLModelBase):
     首次请求发空串 ""，每次响应可能返回新 buf。
     """
 
+    account_name: Annotated[Str64, Field(default='default', unique=True, index=True)]
+    """账号唯一别名/名称（如 'default', 'bot2'）"""
+
+    self_id: Annotated[int, Field(default=10000, unique=True, index=True)]
+    """OneBot v11 虚拟 QQ 号，唯一标识（如 10000, 10001）"""
+
 
 class Bridge(
     BridgeBase,
@@ -167,9 +173,9 @@ class Bridge(
     table=True,
 ):
     """
-    iLink 协议会话状态充血模型（单例）。
+    iLink 协议会话状态充血模型。
 
-    单例模式：ID 固定为 BRIDGE_SINGLETON_ID（=1），通过 ``get_instance(session)`` 访问。
+    支持多账号：每个已登录的微信 Bot 对应一张 Bridge 记录。
     """
 
     # ===== 运行时组件（非 DB 字段） =====
@@ -184,16 +190,49 @@ class Bridge(
             cls._id_registry = OneBotMessageIdRegistry()  # pyright: ignore[reportAttributeAccessIssue]
         return cls._id_registry
 
-    # ===== 单例访问 =====
+    # ===== 多账号查询与单例访问 =====
 
     @classmethod
-    async def get_instance(cls, session: AsyncSession) -> 'Bridge':
-        """获取 Bridge 单例实例（ID=BRIDGE_SINGLETON_ID）"""
-        bridge = await cls.get(session, col(cls.id) == BRIDGE_SINGLETON_ID)
+    async def get_by_name(cls, session: AsyncSession, account_name: str) -> 'Bridge | None':
+        """按 account_name 查询 Bridge 实例"""
+        return await cls.get(session, col(cls.account_name) == account_name)
+
+    @classmethod
+    async def get_by_self_id(cls, session: AsyncSession, self_id: int) -> 'Bridge | None':
+        """按 OneBot self_id 查询 Bridge 实例"""
+        return await cls.get(session, col(cls.self_id) == self_id)
+
+    @classmethod
+    async def get_all(cls, session: AsyncSession) -> list['Bridge']:
+        """获取所有已配置的 Bridge 实例列表"""
+        bridges = await cls.get(session, fetch_mode='all')
+        return [b for b in bridges] if bridges else []
+
+    @classmethod
+    async def get_all_active(cls, session: AsyncSession) -> list['Bridge']:
+        """获取所有已就绪（bot_token 非空且非 expired）的 Bridge 实例列表"""
+        all_bridges = await cls.get_all(session)
+        return [b for b in all_bridges if b.bot_token is not None]
+
+    @classmethod
+    async def get_instance(cls, session: AsyncSession, account_name: str = 'default') -> 'Bridge':
+        """获取默认或指定 account_name 的 Bridge 实例（向下兼容原有单账号单例用法）"""
+        bridge = await cls.get_by_name(session, account_name)
         if bridge is None:
-            bridge = cls(id=BRIDGE_SINGLETON_ID)
-            bridge = await bridge.save(session)
-            l.info("Bridge 单例已创建（首次启动）")
+            # 兼容历史数据：若存在 ID=BRIDGE_SINGLETON_ID 的行予以复用
+            bridge = await cls.get(session, col(cls.id) == BRIDGE_SINGLETON_ID)
+            if bridge is not None:
+                bridge.account_name = account_name
+                if not bridge.self_id:
+                    bridge.self_id = meta_config.ONEBOT_SELF_ID
+                bridge = await bridge.save(session)
+            else:
+                bridge = cls(
+                    account_name=account_name,
+                    self_id=meta_config.ONEBOT_SELF_ID,
+                )
+                bridge = await bridge.save(session)
+                l.info(f"Bridge 账号 '{account_name}' (self_id={bridge.self_id}) 已创建")
         return bridge
 
     # ===== iLink HTTP 请求构造 =====
@@ -477,8 +516,13 @@ class Bridge(
         :raises ILinkContextTokenMissingError: 该用户还未向 bot 发过消息（无 context_token）
         """
         context_token_row = await ContextToken.get(
-            session, col(ContextToken.user_name) == user_id,
+            session,
+            (col(ContextToken.user_name) == user_id) & (col(ContextToken.bridge_id) == self.id),
         )
+        if context_token_row is None:
+            context_token_row = await ContextToken.get(
+                session, col(ContextToken.user_name) == user_id,
+            )
         if context_token_row is None:
             raise ILinkContextTokenMissingError(user_id)
 
@@ -530,8 +574,13 @@ class Bridge(
         :raises ValueError: ``media_file`` 未走完 ``prepare_and_upload`` 流程
         """
         context_token_row = await ContextToken.get(
-            session, col(ContextToken.user_name) == user_id,
+            session,
+            (col(ContextToken.user_name) == user_id) & (col(ContextToken.bridge_id) == self.id),
         )
+        if context_token_row is None:
+            context_token_row = await ContextToken.get(
+                session, col(ContextToken.user_name) == user_id,
+            )
         if context_token_row is None:
             raise ILinkContextTokenMissingError(user_id)
 
@@ -648,8 +697,13 @@ class Bridge(
         :raises ILinkAPIError: 上游协议错误
         """
         context_token_row = await ContextToken.get(
-            session, col(ContextToken.user_name) == ilink_user_id,
+            session,
+            (col(ContextToken.user_name) == ilink_user_id) & (col(ContextToken.bridge_id) == self.id),
         )
+        if context_token_row is None:
+            context_token_row = await ContextToken.get(
+                session, col(ContextToken.user_name) == ilink_user_id,
+            )
         if context_token_row is None:
             raise ILinkContextTokenMissingError(ilink_user_id)
 
@@ -735,10 +789,12 @@ class Bridge(
         # UPSERT context_token（每条消息都可能更新该用户的 token）
         if msg.context_token:
             existing = await ContextToken.get(
-                session, col(ContextToken.user_name) == msg.from_user_id,
+                session,
+                (col(ContextToken.user_name) == msg.from_user_id) & (col(ContextToken.bridge_id) == self.id),
             )
             if existing is None:
                 _ = await ContextToken(
+                    bridge_id=self.id,
                     user_name=msg.from_user_id,
                     token=msg.context_token,
                 ).save(session, commit=commit)
@@ -772,7 +828,13 @@ class Bridge(
         if cached is not None:
             return cached
 
-        all_tokens = await ContextToken.get(session, fetch_mode='all')
+        all_tokens = await ContextToken.get(
+            session,
+            col(ContextToken.bridge_id) == self.id,
+            fetch_mode='all',
+        )
+        if not all_tokens:
+            all_tokens = await ContextToken.get(session, fetch_mode='all')
         if all_tokens is None:
             return None
         for row in all_tokens:

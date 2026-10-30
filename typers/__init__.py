@@ -23,3 +23,6 @@ app = typer.Typer(
 import typers.login  # noqa: E402, F401
 import typers.run  # noqa: E402, F401
 import typers.status  # noqa: E402, F401
+from typers.account import account_app  # noqa: E402
+
+app.add_typer(account_app, name='account')
