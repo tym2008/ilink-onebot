@@ -346,6 +346,16 @@ async def handle_get_guild_service_profile(
     return OneBotActionResponse.ok(data={}, echo=action.echo)
 
 
+async def handle_get_guild_list(
+    bridge: Bridge,  # noqa: ARG001
+    session: AsyncSession,  # noqa: ARG001
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """获取频道列表（iLink 个人号无频道，返回空列表）"""
+    return OneBotActionResponse.ok(data=[], echo=action.echo)
+
+
 async def handle_get_online_clients(
     bridge: Bridge,  # noqa: ARG001
     session: AsyncSession,  # noqa: ARG001
@@ -392,6 +402,7 @@ ACTION_HANDLERS: dict[str, ActionHandler] = {
     'get_group_member_list': handle_get_group_member_list,
     '_set_model_show': handle_set_model_show,
     'get_guild_service_profile': handle_get_guild_service_profile,
+    'get_guild_list': handle_get_guild_list,
     'get_online_clients': handle_get_online_clients,
     'get_cookies': handle_get_cookies,
     'get_csrf_token': handle_get_csrf_token,

@@ -33,6 +33,7 @@ from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
+from meta_config import meta_config
 from onebots.constants import BEARER_PREFIX, QUERY_ACCESS_TOKEN_KEY
 from onebots.models import (
     OneBotAction,
@@ -138,6 +139,7 @@ class OneBotWSServer:
                 host=host,
                 port=port,
                 process_request=cls._authenticate_request,
+                max_size=meta_config.ONEBOT_WS_MAX_SIZE,
             ) as server:
                 l.success(f"OneBot v11 WS 服务端启动: ws://{host}:{port}")
                 # 阻塞到 server 关闭（stop() 时取消此任务）

@@ -108,6 +108,14 @@ class MetaConfig(BaseSettings):
     None 则不启用反向 WS 客户端。断开后自动重连（指数退避）。
     """
 
+    ONEBOT_WS_MAX_SIZE: int | None = 64 * 1024 * 1024
+    """
+    OneBot WebSocket 单帧消息最大字节限制（默认 64MB）。
+
+    websockets 库默认仅 1MB (1048576 字节)，当框架发送包含大图片 (如 10MB JPEG)
+    的 Base64 消息时极易触发 1009 (message too big) 错误断开连接。提高此阈值可安全容纳。
+    """
+
     # ===== 媒体 HTTP 服务 =====
 
     MEDIA_SERVE_HOST: str = '0.0.0.0'

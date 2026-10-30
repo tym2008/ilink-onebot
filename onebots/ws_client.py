@@ -27,6 +27,7 @@ from loguru import logger as l
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from meta_config import meta_config
 from onebots.constants import (
     CLIENT_ROLE_UNIVERSAL,
     DEFAULT_USER_AGENT,
@@ -233,6 +234,7 @@ class OneBotWSClient:
             additional_headers=headers,
             user_agent_header=DEFAULT_USER_AGENT,
             open_timeout=_OPEN_TIMEOUT_SECONDS,
+            max_size=meta_config.ONEBOT_WS_MAX_SIZE,
         ) as connection:
             cls._connection = connection  # pyright: ignore[reportAttributeAccessIssue]
             l.success(f"反向 WS 已连接: {cls._url}")
