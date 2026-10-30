@@ -1,4 +1,5 @@
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -274,4 +275,123 @@ async def test_second_account_image_sending_routes_to_second_bot(test_session_fa
         assert len(called_send_media_bridges) == 1
         assert called_send_media_bridges[0].id == b2.id
         assert called_send_media_bridges[0].account_name == 'bot2'
+
+
+@pytest.mark.asyncio
+async def test_reply_segment_with_mapped_id_and_fallback_on_failure(test_session_factory):
+    """测试出站带有 reply 段时，如果支持则携带 ref_msg 发送；如果 iLink 发送失败则丢弃 reply 段回退重发"""
+    from sqlmodels.bridge.exceptions import ILinkAPIError
+    from sqlmodels.onebot_message_mapping import OneBotMessageMapping
+
+    async with test_session_factory() as session:
+        b1 = await Bridge.get_by_name(session, 'default')
+        assert b1 is not None
+        b1.bot_token = "token_b1"
+        b1.self_id = 10000
+        b1.state = BridgeStateEnum.running
+        await b1.save(session)
+
+        ct = ContextToken(bridge_id=b1.id, user_name="wx_user_reply", token="ctx_token_reply")
+        await ct.save(session)
+
+        # 预置消息映射：onebot 消息 14 -> ilink 消息 "wx_msg_ilink_14"
+        mapping = OneBotMessageMapping(onebot_message_id=14, ilink_msg_id="wx_msg_ilink_14")
+        await mapping.save(session)
+
+        config = await ServerConfig.get_instance(session)
+
+    reg = b1.get_id_registry()
+    onebot_uid = reg.resolve_user_id("wx_user_reply")
+
+    action_reply = OneBotAction(
+        action="send_msg",
+        params={
+            "user_id": onebot_uid,
+            "message": [
+                {"type": "reply", "data": {"id": "14"}},
+                {"type": "text", "data": {"text": "hello with reply"}},
+            ],
+        },
+        echo="test_reply_echo",
+    )
+
+    # 场景 1：首次尝试携带 ref_msg 发送成功
+    calls_scenario1: list[dict[str, Any]] = []
+
+    async def mock_send_text_success(self, *args, **kwargs):
+        calls_scenario1.append(kwargs)
+        return "msg_123"
+
+    with patch.object(Bridge, "send_text", mock_send_text_success):
+        resp = await dispatch_action(b1, test_session_factory, config, action_reply)
+        assert resp.retcode == 0
+        assert len(calls_scenario1) == 1
+        ref_msg = calls_scenario1[0].get("ref_msg")
+        assert ref_msg is not None
+        assert ref_msg.message_item is not None
+        assert ref_msg.message_item.msg_id == "wx_msg_ilink_14"
+
+    # 场景 2：iLink 不支持 reply（报错），自动回退丢弃 reply 段重发
+    calls_scenario2: list[dict[str, Any]] = []
+
+    async def mock_send_text_fallback(self, *args, **kwargs):
+        calls_scenario2.append(kwargs)
+        if kwargs.get("ref_msg") is not None:
+            raise ILinkAPIError(errcode=10001, errmsg="reply not supported", endpoint="sendmessage")
+        return "msg_124"
+
+    with patch.object(Bridge, "send_text", mock_send_text_fallback):
+        resp = await dispatch_action(b1, test_session_factory, config, action_reply)
+        assert resp.retcode == 0
+        # 应该调用 2 次：第 1 次带 ref_msg 失败，第 2 次不带 ref_msg 成功
+        assert len(calls_scenario2) == 2
+        assert calls_scenario2[0].get("ref_msg") is not None
+        assert calls_scenario2[1].get("ref_msg") is None
+        assert calls_scenario2[1].get("content") == "hello with reply"
+
+
+@pytest.mark.asyncio
+async def test_reply_segment_with_unmapped_id_falls_back_directly(test_session_factory):
+    """测试未映射的 reply 段不会抛 NotImplementedError，而是丢弃 reply 段直接发送"""
+    async with test_session_factory() as session:
+        b1 = await Bridge.get_by_name(session, 'default')
+        assert b1 is not None
+        b1.bot_token = "token_b1"
+        b1.self_id = 10000
+        b1.state = BridgeStateEnum.running
+        await b1.save(session)
+
+        ct = ContextToken(bridge_id=b1.id, user_name="wx_user_unmapped", token="ctx_token_unmapped")
+        await ct.save(session)
+
+        config = await ServerConfig.get_instance(session)
+
+    reg = b1.get_id_registry()
+    onebot_uid = reg.resolve_user_id("wx_user_unmapped")
+
+    action_unmapped = OneBotAction(
+        action="send_msg",
+        params={
+            "user_id": onebot_uid,
+            "message": [
+                {"type": "reply", "data": {"id": "99999"}},  # 未映射的 ID
+                {"type": "text", "data": {"text": "hello direct"}},
+            ],
+        },
+        echo="test_unmapped_echo",
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    async def mock_send_text(self, *args, **kwargs):
+        calls.append(kwargs)
+        return "msg_direct"
+
+    with patch.object(Bridge, "send_text", mock_send_text):
+        resp = await dispatch_action(b1, test_session_factory, config, action_unmapped)
+        assert resp.retcode == 0
+        assert len(calls) == 1
+        assert calls[0].get("ref_msg") is None
+        assert calls[0].get("content") == "hello direct"
+
 

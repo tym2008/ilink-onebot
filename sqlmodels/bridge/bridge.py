@@ -94,6 +94,7 @@ from sqlmodels.bridge.ilink_models import (
     QRCodeRequest,
     QRCodeResponse,
     QRCodeStatusResponse,
+    RefMessage,
     SendMessageRequest,
     SendMessageResponse,
     SendTypingRequest,
@@ -510,12 +511,15 @@ class Bridge(
         session: AsyncSession,
         user_id: str,
         content: str,
+        *,
+        ref_msg: RefMessage | None = None,
     ) -> str | None:
         """
         发送文本消息给指定 iLink user_id。
 
         :param user_id: iLink user_id（ContextToken 表中存的 user_name 字段）
         :param content: 文本内容
+        :param ref_msg: 可选的引用回复段
         :return: iLink 分配的 message_id（None 表示服务端未返回）
         :raises ILinkContextTokenMissingError: 该用户还未向 bot 发过消息（无 context_token）
         """
@@ -535,6 +539,7 @@ class Bridge(
         item = MessageItem(
             type=ILinkMessageItemType.TEXT,
             text_item=TextItem(text=content),
+            ref_msg=ref_msg,
         )
         # ``from_user_id=""`` 与 ``client_id`` 是 iLink 服务端的硬性要求（与官方
         # ``send.ts:buildTextMessageReq`` 对齐）。缺失任一字段 iLink 会返回 200 +
@@ -552,6 +557,7 @@ class Bridge(
         l.info(
             f"Bridge '{self.account_name}' (self_id={self.self_id}) 发送文本消息: "
             f"to={user_id}, content={content[:30]}..."
+            + (f", ref_msg={ref_msg}" if ref_msg else "")
         )
         # SendMessageResp 是空 body；用其 ret/errcode 状态判断
         _ = await self._post_ilink(
@@ -573,6 +579,7 @@ class Bridge(
         media_file: 'MediaFile',
         *,
         caption: str | None = None,
+        ref_msg: RefMessage | None = None,
     ) -> None:
         """
         发送媒体消息给指定 iLink user_id。
@@ -601,6 +608,8 @@ class Bridge(
             raise ILinkContextTokenMissingError(user_id)
 
         media_item = _build_message_item_from_media(media_file)
+        if ref_msg is not None:
+            media_item.ref_msg = ref_msg
         item_list: list[MessageItem] = [media_item]
         if caption is not None and caption.strip():
             # caption 作为独立 TEXT item 与媒体 item 一起送出

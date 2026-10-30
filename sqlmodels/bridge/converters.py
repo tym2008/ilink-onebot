@@ -32,6 +32,7 @@ from sqlmodels.bridge.exceptions import OneBotMappingMissingError
 from sqlmodels.bridge.id_registry import OneBotMessageIdRegistry
 from sqlmodels.bridge.ilink_models import (
     MessageItem,
+    RefMessage,
     WeixinMessage,
 )
 from sqlmodels.media_file import MediaFile
@@ -311,8 +312,8 @@ async def dispatch_outbound_segments(
     - **拆分媒体段**：每个媒体段触发一次 ``send_media``；第一个媒体段携带合并后的
       text 作为附带文本（如果协议支持的话——iLink 当前媒体段 caption 实现有限）
     - **纯文本场景**：无媒体段时，单次 ``send_text``
-    - **reply 段**：暂不支持出站（iLink ref_msg 嵌入到 MessageItem.ref_msg 复杂度高，
-      留待后续）；如出现仅日志记录，不影响主体送达
+    - **reply 段**：支持出站。根据 OneBot message_id 反查映射构造 ``MessageItem.ref_msg`` 尝试发送；
+      若未查到映射或 iLink 发送失败，则自动回退丢弃 reply 段直接发送主体消息
 
     :param target_user_id: 已通过 OneBot user_id 反查得到的 iLink user_id
     :return: 最后一次发送的 iLink message_id（当前 iLink sendmessage 响应不返回，
@@ -320,7 +321,7 @@ async def dispatch_outbound_segments(
 
     :raises MediaOutboundError: 任何媒体段发送失败
     :raises ILinkContextTokenMissingError: 目标用户无 context_token
-    :raises NotImplementedError: 段类型暂未实现（reply 段嵌入待实现；face / at / share 等扩展段不支持）
+    :raises NotImplementedError: 未支持段类型（face / at / share 等扩展段不支持）
     """
     # 分类段
     text_parts: list[str] = []
@@ -338,19 +339,41 @@ async def dispatch_outbound_segments(
         else:
             unknown_segments.append(seg)
 
-    # 出站 reply 段：当前不支持（要嵌入到 MessageItem.ref_msg）。明确抛错，不吞掉。
-    if reply_segments:
-        raise NotImplementedError(
-            f"出站 reply 段当前不支持（需将 ref_msg 嵌入 MessageItem，待后续版本实现）。"
-            f"本次消息含 {len(reply_segments)} 个 reply 段被拒绝"
-        )
-
     # 未知段类型：明确抛错而非吞掉（信息密度优先）
     if unknown_segments:
         types = [s.type for s in unknown_segments]
         raise NotImplementedError(
-            f"出站消息含未支持段类型: {types}（仅支持 text / image / record / video / file）"
+            f"出站消息含未支持段类型: {types}（仅支持 text / image / record / video / file / reply）"
         )
+
+    # 解析出站 reply 段（若存在）
+    ref_msg: RefMessage | None = None
+    if reply_segments:
+        reply_seg = reply_segments[0]
+        raw_reply_id = reply_seg.data.get('id')
+        if raw_reply_id is not None:
+            ilink_msg_id: str | None = None
+            try:
+                onebot_reply_id = int(raw_reply_id)
+                registry = bridge.get_id_registry()
+                ilink_msg_id = await registry.resolve_ilink_message_id(session, onebot_reply_id)
+            except (ValueError, TypeError):
+                ilink_msg_id = str(raw_reply_id)
+
+            if ilink_msg_id is not None:
+                ref_msg = RefMessage(
+                    message_item=MessageItem(
+                        type=ILinkMessageItemType.NONE,
+                        msg_id=str(ilink_msg_id),
+                    ),
+                )
+                l.info(
+                    f"出站 reply 段成功关联 iLink 消息: onebot_id={raw_reply_id} -> ilink_msg_id={ilink_msg_id}"
+                )
+            else:
+                l.info(
+                    f"出站 reply 段未在本地映射中找到对应 iLink 消息 (id={raw_reply_id})，丢弃 reply 段直接发送"
+                )
 
     combined_text = ''.join(text_parts).strip()
 
@@ -358,24 +381,41 @@ async def dispatch_outbound_segments(
     if not media_segments:
         if not combined_text:
             raise ValueError("出站消息既无文本段又无媒体段，无内容可发送")
+
+        if ref_msg is not None:
+            try:
+                await bridge.send_text(
+                    session=session,
+                    user_id=target_user_id,
+                    content=combined_text,
+                    ref_msg=ref_msg,
+                )
+                return None
+            except Exception as e:
+                l.warning(
+                    f"iLink 发送带 reply 文本消息失败 ({e})，丢弃 reply 段回退直接发送"
+                )
+
         await bridge.send_text(
             session=session,
             user_id=target_user_id,
             content=combined_text,
+            ref_msg=None,
         )
         return None
 
     # 有媒体段：iLink 单消息单媒体，逐个发送
-    # 第一个媒体段尝试附带 text 作为 caption（当前 send_media 实现可决定是否拼到主体）；
-    # 其余媒体段只发媒体不带 text
+    # 第一个媒体段尝试附带 text 作为 caption 和可选的 ref_msg；其余媒体段只发媒体不带 text
     for index, seg in enumerate(media_segments):
         caption = combined_text if index == 0 else None
+        seg_ref_msg = ref_msg if index == 0 else None
         await _send_outbound_media_segment(
             bridge=bridge,
             session=session,
             target_user_id=target_user_id,
             segment=seg,
             caption=caption,
+            ref_msg=seg_ref_msg,
         )
 
     return None
@@ -387,6 +427,7 @@ async def _send_outbound_media_segment(
     target_user_id: str,
     segment: OneBotSegment,
     caption: str | None,
+    ref_msg: RefMessage | None = None,
 ) -> None:
     """
     单个 OneBot 媒体段端到端发送：
@@ -398,6 +439,7 @@ async def _send_outbound_media_segment(
     5. ``Bridge.send_media(...)`` 构造 ``MessageItem`` + 发 sendmessage
 
     任何阶段失败都 raise ``MediaOutboundError`` 携带阶段标识。
+    若带 ref_msg 发送失败，自动丢弃 ref_msg 直接发送。
     """
     from sqlmodels.media_file import MediaFile
 
@@ -411,9 +453,25 @@ async def _send_outbound_media_segment(
     await media_file.fetch_outbound_source(bridge, session)
     await media_file.prepare_and_upload(bridge, session, to_user_id=target_user_id)
 
+    if ref_msg is not None:
+        try:
+            await bridge.send_media(
+                session=session,
+                user_id=target_user_id,
+                media_file=media_file,
+                caption=caption,
+                ref_msg=ref_msg,
+            )
+            return
+        except Exception as e:
+            l.warning(
+                f"iLink 发送带 reply 媒体消息失败 ({e})，丢弃 reply 段回退直接发送"
+            )
+
     await bridge.send_media(
         session=session,
         user_id=target_user_id,
         media_file=media_file,
         caption=caption,
+        ref_msg=None,
     )

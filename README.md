@@ -182,7 +182,7 @@ dist/ilink-onebot.exe run
 | `VOICE`   | `record`     | 同上 |
 | `FILE`    | `file`       | NapCat 扩展段 |
 | `VIDEO`   | `video`      | 同上 |
-| `ref_msg` | `reply`      | 引用回复 |
+| `ref_msg` | `reply`      | 引用回复（出站支持按 message_id 反查尝试携带引用；若未命中或平台发送失败自动降级丢弃 reply 直接发送） |
 
 入站的 `GENERATING` 状态消息会被跳过（OneBot v11 无流式消息概念，等 `FINISH` 再发）。
 
