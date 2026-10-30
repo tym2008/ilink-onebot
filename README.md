@@ -24,20 +24,20 @@ OneBot v11 生态**。本项目填补这一空白——你可以继续用熟悉�
 ## 它能做什么
 
 - ✅ **直接复用 OneBot v11 框架**：写一次插件，QQ 和微信都能用
+- ✅ **支持多账号同时在线**：单进程支持配置与并发运行多个微信 Bot，共用一条 WS 连接，各自独立维护 `self_id`
 - ✅ **支持全部 iLink 消息类型**：文本 / 图片 / 语音 / 视频 / 文件 / 引用回复
-- ✅ **会话持久化**：进程重启后自动恢复登录状态和长轮询游标，不丢消息
+- ✅ **正向与反向 WebSocket**：支持框架连入（正向 WS 模式）与主动连出到框架（反向 WS 客户端模式）
+- ✅ **会话持久化**：进程重启后自动恢复所有账号的登录状态和长轮询游标，不丢消息
 - ✅ **优雅扫码登录**：终端直接渲染 QR 码，远程 SSH 也能扫
-- ✅ **零侵入部署**：你的 OneBot 框架不用改一行代码，把它当 NapCat 一样连过来即可
-- ✅ **自动重登**：iLink 会话过期（errcode -14）后自动重新引导扫码
+- ✅ **零侵入部署**：你的 OneBot 框架不用改一行代码，把它当 NapCat / Lagrange 一样接入
+- ✅ **自动重登**：iLink 会话过期（errcode -14）后自动引导扫码重登
 
 ## 它**不**能做什么
 
 - ❌ **群聊**：iLink 协议本身不支持群聊，仅支持 1:1 私聊
 - ❌ **撤回消息**：iLink 无撤回 API
-- ❌ **好友列表 / 陌生人信息查询**：iLink 不暴露联系人接口
-- ❌ **多账号**：每个桥接进程只对应一个微信账号（iLink 的 1:1 绑定限制）
-- ❌ **主动发消息**：所有发送必须由用户先发消息（建立 `context_token`）后触发——这是
-  iLink 协议层面的设计，非桥接器限制
+- ❌ **主动发消息**：所有发送必须由用户先向对应账号发消息（建立 `context_token`）后触发——这是
+  iLink 协议层面的安全与风控设计，非桥接器限制
 
 ---
 
@@ -54,46 +54,64 @@ uv sync
 cp .env.example .env       # 端口、缓存路径等可在此处调整
 ```
 
-### 2. 扫码登录
+### 2. 扫码登录（支持多账号）
 
+**登录首个/默认账号（默认 self_id=10000）：**
 ```bash
 uv run ilink-onebot login
 ```
 
-终端会渲染一个 QR 码，用微信"扫一扫"即可。登录信息会被写入本地 SQLite，
-下次启动主服务时自动加载。
+**登录第二个账号（指定别名及可选的 self_id）：**
+```bash
+uv run ilink-onebot login bot2 --self-id 10001
+```
 
-### 3. 启动主服务
+终端会渲染一个 QR 码，用对应微信"扫一扫"即可。登录凭据自动持久化至本地 SQLite。若需重置会话重新扫码，追加 `--force` 参数即可。
+
+### 3. 账号管理
+
+```bash
+# 查看所有已登录账号、self_id、微信昵称与状态
+uv run ilink-onebot account list
+
+# 移除指定的账号及其会话数据
+uv run ilink-onebot account remove bot2
+```
+
+### 4. 启动主服务
 
 ```bash
 uv run ilink-onebot run
 ```
 
-此时桥接器会监听三个端口：
+主服务启动后会自动为所有已就绪账号拉起并发长轮询，并通过 WebSocket 提供 OneBot 服务：
 
-| 监听 | 协议 | 说明 |
-|------|------|------|
-| `ws://0.0.0.0:6700/` | WebSocket | OneBot v11 反向 WS（让你的框架连接） |
-| `http://0.0.0.0:5701/` | HTTP | 媒体服务（框架通过它下载图片/视频） |
-| `https://ilinkai.weixin.qq.com` | HTTPS 出站 | iLink 长轮询（后台静默接收消息） |
+| 服务 | 模式 / 协议 | 说明 |
+|------|-----------|------|
+| `ws://0.0.0.0:6700/` | WS 服务端（正向） | 监听端口，等待 OneBot 框架连接接入 |
+| `ws://<框架地址>/...` | WS 客户端（反向） | 主动连接到框架（通过 `.env` 中的 `ONEBOT_REVERSE_WS_URL` 启用） |
+| `http://0.0.0.0:5701/` | HTTP 媒体服务 | 媒体下载中继代理（框架在此获取解密后的图片/音频/视频） |
+| `https://ilinkai.weixin.qq.com` | HTTPS 出站 | 各账号独立的腾讯 iLink 消息长轮询通道 |
 
-### 4. 连接你的 OneBot 框架
+### 5. 连接你的 OneBot 框架
 
-以 NoneBot2 为例，在 `.env.dev` 中：
+- **正向连接（框架主动连接 ilink-onebot）**：以 NoneBot2 为例，在 `.env.dev` 中配置：
+  ```env
+  ONEBOT_WS_URLS=["ws://127.0.0.1:6700/"]
+  ```
+- **反向连接（ilink-onebot 主动连接框架）**：以 TRSS-Yunzai 或 NoneBot2 反向端点为例，在 `ilink-onebot/.env` 中配置：
+  ```env
+  ONEBOT_REVERSE_WS_URL=ws://127.0.0.1:2536/OneBotv11
+  ```
+  连接握手时，所有已登录的 Bot 将会在同一条连接上广播各自的 `lifecycle: connect` / `lifecycle: enable` 事件并同时上线（如 TRSS-Yunzai 中 `Bot[10000]` 与 `Bot[10001]` 同时点亮）。
 
-```env
-ONEBOT_WS_URLS=["ws://127.0.0.1:6700/"]
-```
-
-启动 NoneBot2，给登录的微信号发条消息，应该能在 NoneBot 日志看到 `MessageEvent`。
-
-### 5. 查看运行状态
+### 6. 查看运行状态
 
 ```bash
 uv run ilink-onebot status
 ```
 
-输出 Bridge 状态、登录信息、媒体缓存统计等。
+输出所有 Bridge 账号状态、微信昵称、配置详情及媒体缓存统计。
 
 ---
 
@@ -141,13 +159,15 @@ dist/ilink-onebot.exe run
 
 | 动作 | 支持 | 说明 |
 |------|------|------|
-| `send_private_msg` / `send_msg`(private) | ✅ | 文本 / reply / 媒体段 |
-| `get_login_info` | ✅ | 返回登录的微信昵称 |
+| `send_private_msg` / `send_msg`(private) | ✅ | 文本 / reply / 媒体段（支持多账号根据 user_id 或 self_id 智能路由） |
+| `get_login_info` | ✅ | 动态返回对应账号的 `self_id` 及微信昵称 |
 | `get_status` / `get_version_info` | ✅ | 元信息查询 |
 | `can_send_image` / `can_send_record` | ✅ | 始终返回 true |
+| `get_friend_list` / `get_stranger_info` | ✅ | 从数据库会话记录返回已交互联系人（兼容 TRSS-Yunzai 等框架初始化） |
+| `get_group_list` / `get_group_member_list` | ✅ | 返回空列表（个人号无群聊，防报错兼容） |
+| `_set_model_show` / `get_guild_*` / `get_online_clients` | ✅ | 框架兼容性占位响应 |
 | `send_group_msg` / 群管理类 | ❌ | iLink 不支持群聊，返回 retcode=1404 |
 | `delete_msg` | ❌ | iLink 无撤回 API，返回 retcode=1404 |
-| `get_friend_list` / `get_stranger_info` | ❌ | iLink 无联系人接口，返回 retcode=1404 |
 
 ### 消息段映射
 
@@ -213,10 +233,10 @@ dist/ilink-onebot.exe run
 
 ## 兼容的 OneBot v11 框架
 
-只要遵循 [OneBot v11 标准](https://github.com/botuniverse/onebot-11)，反向 WS
-连接到 `ws://127.0.0.1:6700/` 都应该可用：
+只要遵循 [OneBot v11 标准](https://github.com/botuniverse/onebot-11)，通过正向 WS（`ws://127.0.0.1:6700/`）或反向 WS（主动连向框架端点）都可无缝对接：
 
-- [NoneBot2](https://github.com/nonebot/nonebot2)（已实测）
+- [TRSS-Yunzai](https://github.com/TimeRainStarSky/Yunzai)（搭配 `OneBotv11` 适配器插件，已实测反向 WS 与单连接多账号 `Bot[self_id]` 同时上线）
+- [NoneBot2](https://github.com/nonebot/nonebot2)（已实测正向与反向 WS）
 - [AstrBot](https://github.com/Soulter/AstrBot)
 - [Koishi](https://koishi.chat/)（搭配 [onebot 适配器](https://github.com/koishijs/koishi-plugin-adapter-onebot)）
 - 其他兼容框架欢迎在 Issues 区报告兼容性
