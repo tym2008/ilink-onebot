@@ -18,6 +18,7 @@ action 回调与 ``OneBotWSServer.set_action_callback`` 设的是同一份（``o
 ``typers/run.py`` 启动时把 callback 注册到两个 transport），保证两边收 action 行为一致。
 """
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from typing import ClassVar
 
@@ -26,11 +27,21 @@ from loguru import logger as l
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from onebots.constants import CLIENT_ROLE_UNIVERSAL, HEADER_CLIENT_ROLE, HEADER_SELF_ID
+from onebots.constants import (
+    CLIENT_ROLE_UNIVERSAL,
+    DEFAULT_USER_AGENT,
+    HEADER_CLIENT_ROLE,
+    HEADER_SELF_ID,
+)
 from onebots.models import (
     OneBotAction,
     OneBotActionResponse,
     OneBotEventBase,
+    OneBotHeartbeatStatus,
+    OneBotLifecycleSubTypeEnum,
+    OneBotMetaEvent,
+    OneBotMetaEventTypeEnum,
+    OneBotPostTypeEnum,
     OneBotRetCodeEnum,
 )
 
@@ -210,6 +221,7 @@ class OneBotWSClient:
         assert cls._url is not None and cls._self_id is not None  # checked in _connect_loop
 
         headers: dict[str, str] = {
+            'User-Agent': DEFAULT_USER_AGENT,
             HEADER_SELF_ID: str(cls._self_id),
             HEADER_CLIENT_ROLE: CLIENT_ROLE_UNIVERSAL,
         }
@@ -219,14 +231,64 @@ class OneBotWSClient:
         async with connect(
             cls._url,
             additional_headers=headers,
+            user_agent_header=DEFAULT_USER_AGENT,
             open_timeout=_OPEN_TIMEOUT_SECONDS,
         ) as connection:
             cls._connection = connection  # pyright: ignore[reportAttributeAccessIssue]
             l.success(f"反向 WS 已连接: {cls._url}")
             try:
+                await cls._send_bootstrap_events(connection)
                 await cls._consume_messages(connection)
             finally:
                 cls._connection = None  # pyright: ignore[reportAttributeAccessIssue]
+
+    @classmethod
+    async def _send_bootstrap_events(cls, connection: ClientConnection) -> None:
+        """
+        连接建立后立即发送 OneBot v11 bootstrap 元事件。
+
+        按 OneBot 规范和常见框架（如 TRSS-Yunzai / NoneBot2）预期，依序发送：
+        1. lifecycle: connect
+        2. lifecycle: enable
+        3. heartbeat（附带当前状态）
+        """
+        if cls._self_id is None:
+            return
+
+        now = int(time.time())
+        events = [
+            OneBotMetaEvent(
+                time=now,
+                self_id=cls._self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                sub_type=OneBotLifecycleSubTypeEnum.connect,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+            OneBotMetaEvent(
+                time=now,
+                self_id=cls._self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                sub_type=OneBotLifecycleSubTypeEnum.enable,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+            OneBotMetaEvent(
+                time=now,
+                self_id=cls._self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
+                interval=15000,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+        ]
+        for event in events:
+            payload = orjson.dumps(event.model_dump(exclude_none=True))
+            await connection.send(payload)
+            l.debug(
+                f"反向 WS 已发送 bootstrap 事件: {event.meta_event_type}."
+                f"{event.sub_type or 'heartbeat'}"
+            )
 
     @classmethod
     async def _consume_messages(cls, connection: ClientConnection) -> None:

@@ -22,6 +22,7 @@ OneBot v11 WebSocket 服务端（Reverse WS 服务端模式）
 :author: Foxerine <https://github.com/Foxerine>
 """
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from typing import ClassVar
 from urllib.parse import parse_qs, urlparse
@@ -37,6 +38,11 @@ from onebots.models import (
     OneBotAction,
     OneBotActionResponse,
     OneBotEventBase,
+    OneBotHeartbeatStatus,
+    OneBotLifecycleSubTypeEnum,
+    OneBotMetaEvent,
+    OneBotMetaEventTypeEnum,
+    OneBotPostTypeEnum,
     OneBotRetCodeEnum,
 )
 
@@ -234,6 +240,8 @@ class OneBotWSServer:
         peer = connection.remote_address
         l.info(f"OneBot WS 客户端已连接: {peer}（当前 {len(cls._connections)} 连接）")
 
+        await cls._send_bootstrap_events(connection)
+
         try:
             async for raw in connection:
                 if isinstance(raw, bytes):
@@ -244,6 +252,48 @@ class OneBotWSServer:
         finally:
             cls._connections.discard(connection)
             l.info(f"OneBot WS 客户端断开: {peer}（剩余 {len(cls._connections)} 连接）")
+
+    @classmethod
+    async def _send_bootstrap_events(cls, connection: ServerConnection) -> None:
+        """
+        连接建立后向该客户端发送 bootstrap 元事件（connect / enable / heartbeat）。
+        """
+        if cls._self_id is None:
+            return
+
+        now = int(time.time())
+        events = [
+            OneBotMetaEvent(
+                time=now,
+                self_id=cls._self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                sub_type=OneBotLifecycleSubTypeEnum.connect,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+            OneBotMetaEvent(
+                time=now,
+                self_id=cls._self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.lifecycle,
+                sub_type=OneBotLifecycleSubTypeEnum.enable,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+            OneBotMetaEvent(
+                time=now,
+                self_id=cls._self_id,
+                post_type=OneBotPostTypeEnum.meta_event,
+                meta_event_type=OneBotMetaEventTypeEnum.heartbeat,
+                interval=15000,
+                status=OneBotHeartbeatStatus(online=True, good=True),
+            ),
+        ]
+        for event in events:
+            payload = orjson.dumps(event.model_dump(exclude_none=True))
+            try:
+                await connection.send(payload)
+            except ConnectionClosed:
+                break
 
     @classmethod
     async def _handle_incoming_message(

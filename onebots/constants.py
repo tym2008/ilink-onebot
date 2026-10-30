@@ -30,3 +30,7 @@ HEADER_CLIENT_ROLE: str = 'X-Client-Role'
 
 CLIENT_ROLE_UNIVERSAL: str = 'Universal'
 """通用 WS 客户端角色（同时收事件和接收动作）"""
+
+DEFAULT_USER_AGENT: str = f'{ONEBOT_APP_NAME}/{ONEBOT_APP_VERSION}'
+"""Reverse WS 客户端默认 User-Agent（避免发送 Python 标识）"""
+

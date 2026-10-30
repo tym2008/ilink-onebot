@@ -4,20 +4,22 @@ OneBot v11 动作分发器（薄分发层）
 把 OneBot 框架发来的 action 请求路由到对应的 handler 函数。
 每个 handler 委托给 Bridge 充血方法，本模块不写业务逻辑。
 
-支持的动作（与 iLink 协议能力匹配）：
+支持的动作（与 iLink 协议能力匹配及机器人框架初始化兼容）：
 - `send_private_msg` / `send_msg`：调用 Bridge.send_text/send_media（具体由 converters 决定）
 - `get_login_info`：返回 ServerConfig.bot_display_name + Bridge.onebot_self_id
 - `get_status` / `get_version_info` / `can_send_image` / `can_send_record`：元信息查询
+- `get_friend_list` / `get_stranger_info`：从 ContextToken 返回已知微信联系人
+- `get_group_list` / `get_group_member_list`：返回空列表（个人号无群聊）
+- `_set_model_show` / `get_guild_service_profile` / `get_online_clients` / `get_cookies` / `get_csrf_token`：框架兼容占位接口
 
 不支持的动作（iLink 无对应能力）：
 - `send_group_msg` / `set_group_*`：iLink 不支持群聊
 - `delete_msg`：iLink 无撤回 API
-- `get_friend_list` / `get_stranger_info`：iLink 无联系人 API
 
 不支持的动作统一返回 `retcode=1404`（NOT_FOUND）。
 """
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger as l
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -36,6 +38,7 @@ from onebots.models import (
     OneBotSegment,
 )
 from sqlmodels.bridge import Bridge
+from sqlmodels.bridge.context_token import ContextToken
 from sqlmodels.bridge.enums import BridgeStateEnum
 from sqlmodels.server_config import ServerConfig
 
@@ -146,17 +149,35 @@ def _parse_message_param(raw: object) -> list[OneBotSegment]:
     """
     把 OneBot v11 action.params['message'] 解析为段数组。
 
-    OneBot v11 框架可能传入两种格式：
-    - 数组：`[{type, data}, ...]`（OneBot v11 array 格式）
-    - 字符串：纯文本，等价于 `[{type='text', data={text: ...}}]`
-
-    本桥接暂不解析 CQ 码字符串（如 `[CQ:image,file=...]`）—— v11 array 格式
-    是现代实现的主流，框架侧通常都用 array。
+    支持：
+    - 纯字符串：自动包装为 `text` 段
+    - 标准 segment 数组：`[{type, data}, ...]`
+    - 扁平 segment 数组（部分框架传入如 `[{type: 'text', text: '...'}]`）
+    - 数组中混杂的字符串项：自动包装为 `text` 段
     """
     if isinstance(raw, str):
         return [OneBotSegment(type='text', data={'text': raw})]
     if isinstance(raw, list):
-        return [OneBotSegment.model_validate(item) for item in raw]
+        parsed: list[OneBotSegment] = []
+        for item in raw:
+            if isinstance(item, str):
+                parsed.append(OneBotSegment(type='text', data={'text': item}))
+            elif isinstance(item, dict):
+                if 'data' not in item or not isinstance(item.get('data'), dict):
+                    data_dict: dict[str, Any] = {
+                        k: v for k, v in item.items() if k != 'type'
+                    }
+                    parsed.append(
+                        OneBotSegment(
+                            type=str(item.get('type', 'text')),
+                            data=data_dict,
+                        )
+                    )
+                else:
+                    parsed.append(OneBotSegment.model_validate(item))
+            elif isinstance(item, OneBotSegment):
+                parsed.append(item)
+        return parsed
     raise ValueError(f"无法解析 message 参数: {type(raw).__name__}")
 
 
@@ -211,17 +232,148 @@ async def handle_send_msg(
     """
     统一发送消息（OneBot v11 兼容动作）。
 
-    `message_type='private'` → 转发到 handle_send_private_msg。
-    `message_type='group'` 或缺失 → 1404（本桥接不支持群聊）。
+    - `message_type='group'` 或包含 `group_id` 且无 `user_id`：返回 1404（iLink 不支持群聊）
+    - `message_type='private'` 或包含 `user_id`：转发到 handle_send_private_msg
     """
-    message_type = action.params.get('message_type', 'private')
-    if message_type != 'private':
+    group_id = action.params.get('group_id')
+    user_id = action.params.get('user_id')
+    message_type = action.params.get('message_type')
+
+    if (group_id is not None and user_id is None) or message_type == 'group':
         return OneBotActionResponse.failed(
             retcode=OneBotRetCodeEnum.NOT_FOUND,
             echo=action.echo,
-            data={'error': f"message_type={message_type} 不支持（iLink 无群聊）"},
+            data={'error': "iLink 不支持群聊消息（仅支持私聊）"},
         )
     return await handle_send_private_msg(bridge, session, config, action)
+
+
+async def handle_get_friend_list(
+    bridge: Bridge,
+    session: AsyncSession,
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """
+    获取好友列表（OneBot v11 标准动作）。
+
+    从 ContextToken 表中查询已与 Bot 建立对话的联系人，转换为 OneBot 好友项列表。
+    若无记录返回空列表，避免框架（如 TRSS-Yunzai）在初始化时抛异常中断。
+    """
+    registry = bridge.get_id_registry()
+    tokens = await ContextToken.get(session, fetch_mode='all')
+    friends: list[dict[str, Any]] = []
+    if tokens is not None:
+        for row in tokens:
+            uid = registry.resolve_user_id(row.user_name)
+            friends.append({
+                'user_id': uid,
+                'nickname': row.user_name,
+                'remark': row.user_name,
+            })
+    return OneBotActionResponse.ok(data=friends, echo=action.echo)
+
+
+async def handle_get_stranger_info(
+    bridge: Bridge,
+    session: AsyncSession,
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """
+    获取陌生人信息（OneBot v11 标准动作）。
+
+    若能在 ContextToken/缓存中反查到 user_name 则填入，否则返回占位信息。
+    """
+    raw_user_id = action.params.get('user_id')
+    if raw_user_id is None:
+        return OneBotActionResponse.failed(
+            retcode=OneBotRetCodeEnum.BAD_REQUEST,
+            echo=action.echo,
+            data={'error': "缺少 user_id 参数"},
+        )
+    user_id = int(raw_user_id)
+    user_name = await bridge.resolve_user_id_from_onebot(session, user_id)
+    nickname = user_name if user_name is not None else str(user_id)
+    return OneBotActionResponse.ok(
+        data={
+            'user_id': user_id,
+            'nickname': nickname,
+            'sex': 'unknown',
+            'age': 0,
+        },
+        echo=action.echo,
+    )
+
+
+async def handle_get_group_list(
+    bridge: Bridge,  # noqa: ARG001
+    session: AsyncSession,  # noqa: ARG001
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """获取群列表（iLink 个人号无群聊，返回空列表）"""
+    return OneBotActionResponse.ok(data=[], echo=action.echo)
+
+
+async def handle_get_group_member_list(
+    bridge: Bridge,  # noqa: ARG001
+    session: AsyncSession,  # noqa: ARG001
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """获取群成员列表（iLink 个人号无群聊，返回空列表）"""
+    return OneBotActionResponse.ok(data=[], echo=action.echo)
+
+
+async def handle_set_model_show(
+    bridge: Bridge,  # noqa: ARG001
+    session: AsyncSession,  # noqa: ARG001
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """兼容 Yunzai/TRSS _set_model_show 占位接口"""
+    return OneBotActionResponse.ok(data=None, echo=action.echo)
+
+
+async def handle_get_guild_service_profile(
+    bridge: Bridge,  # noqa: ARG001
+    session: AsyncSession,  # noqa: ARG001
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """兼容频道服务资料查询（返回空字典）"""
+    return OneBotActionResponse.ok(data={}, echo=action.echo)
+
+
+async def handle_get_online_clients(
+    bridge: Bridge,  # noqa: ARG001
+    session: AsyncSession,  # noqa: ARG001
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """返回在线客户端列表（占位返回空客户端列表，与 SnowLuma 对齐）"""
+    return OneBotActionResponse.ok(data={'clients': []}, echo=action.echo)
+
+
+async def handle_get_cookies(
+    bridge: Bridge,  # noqa: ARG001
+    session: AsyncSession,  # noqa: ARG001
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """返回 cookies（iLink 非 QQ 协议，返回空 cookies）"""
+    return OneBotActionResponse.ok(data={'cookies': ''}, echo=action.echo)
+
+
+async def handle_get_csrf_token(
+    bridge: Bridge,  # noqa: ARG001
+    session: AsyncSession,  # noqa: ARG001
+    config: ServerConfig,  # noqa: ARG001
+    action: OneBotAction,
+) -> OneBotActionResponse:
+    """返回 CSRF token（iLink 非 QQ 协议，返回 0）"""
+    return OneBotActionResponse.ok(data={'token': 0}, echo=action.echo)
 
 
 # ===== 注册表 =====
@@ -234,6 +386,15 @@ ACTION_HANDLERS: dict[str, ActionHandler] = {
     'get_version_info': handle_get_version_info,
     'can_send_image': handle_can_send_image,
     'can_send_record': handle_can_send_record,
+    'get_friend_list': handle_get_friend_list,
+    'get_stranger_info': handle_get_stranger_info,
+    'get_group_list': handle_get_group_list,
+    'get_group_member_list': handle_get_group_member_list,
+    '_set_model_show': handle_set_model_show,
+    'get_guild_service_profile': handle_get_guild_service_profile,
+    'get_online_clients': handle_get_online_clients,
+    'get_cookies': handle_get_cookies,
+    'get_csrf_token': handle_get_csrf_token,
 }
 """
 action 名称到 handler 函数的映射。

@@ -116,8 +116,8 @@ class OneBotSegment(SQLModelBase):
     type: str
     """段类型（text/image/record/video/file/reply/at/share/face/...）"""
 
-    data: dict[str, str]
-    """段数据字段（结构因 type 而异）"""
+    data: dict[str, Any]
+    """段数据字段（结构因 type 而异，支持字符串、数字等类型）"""
 
 
 # ===== 发送者信息 =====
@@ -298,14 +298,14 @@ class OneBotActionResponse(SQLModelBase):
     retcode: int
     """整数错误码（0=成功，非 0 见 OneBotRetCodeEnum）"""
 
-    data: dict[str, Any] | None = None
-    """动作返回数据（不同 action 结构差异巨大）"""
+    data: Any = None
+    """动作返回数据（不同 action 结构差异巨大，支持 dict、list、None 等）"""
 
     echo: Any = None
     """回声字段（原样返回请求中的 echo，类型同 ``OneBotAction.echo`` 是任意 JSON 类型）"""
 
     @classmethod
-    def ok(cls, data: dict[str, Any] | None = None, echo: Any = None) -> 'OneBotActionResponse':
+    def ok(cls, data: Any = None, echo: Any = None) -> 'OneBotActionResponse':
         """构造成功响应的便捷工厂方法"""
         return cls(
             status=OneBotActionStatusEnum.ok,
@@ -319,7 +319,7 @@ class OneBotActionResponse(SQLModelBase):
         cls,
         retcode: int,
         echo: Any = None,
-        data: dict[str, Any] | None = None,
+        data: Any = None,
     ) -> 'OneBotActionResponse':
         """构造失败响应的便捷工厂方法"""
         return cls(

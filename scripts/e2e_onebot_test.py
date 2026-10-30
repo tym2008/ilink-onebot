@@ -238,12 +238,27 @@ async def test_can_send_record(client: OneBotClient) -> None:
     assert resp['data'] == {'yes': True}, f"data={resp['data']}"
 
 
+async def test_get_friend_list(client: OneBotClient) -> None:
+    resp = await client.call('get_friend_list')
+    assert resp['status'] == 'ok', f"status={resp['status']}"
+    assert resp['retcode'] == 0, f"retcode={resp['retcode']}"
+    data = resp['data']
+    assert isinstance(data, list), f"data 不是 list: {data!r}"
+
+
+async def test_get_stranger_info(client: OneBotClient) -> None:
+    resp = await client.call('get_stranger_info', {'user_id': 10001})
+    assert resp['status'] == 'ok', f"status={resp['status']}"
+    assert resp['retcode'] == 0, f"retcode={resp['retcode']}"
+    data = resp['data']
+    assert isinstance(data, dict), f"data 不是 dict: {data!r}"
+    assert data['user_id'] == 10001
+
+
 async def test_unsupported_actions(client: OneBotClient) -> None:
     """iLink 不支持的动作应返回 retcode=1404"""
     cases = [
         ('delete_msg', {'message_id': 123}),
-        ('get_friend_list', {}),
-        ('get_stranger_info', {'user_id': 1}),
         ('set_group_kick', {'group_id': 1, 'user_id': 2}),
         ('totally_unknown_action_xyz', {}),
     ]
@@ -359,6 +374,8 @@ async def run_tests(args: argparse.Namespace) -> bool:
                 await runner.run('get_login_info', lambda: test_get_login_info(client))
                 await runner.run('can_send_image', lambda: test_can_send_image(client))
                 await runner.run('can_send_record', lambda: test_can_send_record(client))
+                await runner.run('get_friend_list', lambda: test_get_friend_list(client))
+                await runner.run('get_stranger_info', lambda: test_get_stranger_info(client))
                 await runner.run(
                     'unsupported actions return 1404',
                     lambda: test_unsupported_actions(client),
