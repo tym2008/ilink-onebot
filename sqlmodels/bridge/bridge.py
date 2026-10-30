@@ -401,10 +401,11 @@ class Bridge(
         请求体携带 ``local_token_list`` 让服务端做去重 / 复用检测；本桥接是
         single-bot 设计，正常发空列表即可。
         """
-        # local_token_list：当前已知的 bot_token（用于服务端识别"已登录账号"）
-        # single-bot 模式正常为空
-        local_token_list: list[str] = []
-        if self.bot_token is not None:
+        all_active = await Bridge.get_all_active(session)
+        local_token_list: list[str] = [
+            b.bot_token for b in all_active if b.bot_token is not None
+        ]
+        if self.bot_token is not None and self.bot_token not in local_token_list:
             local_token_list.append(self.bot_token)
 
         # QR 请求不含 base_info（与官方一致，见 login-qr.ts:fetchQRCode）
@@ -418,7 +419,10 @@ class Bridge(
         self.state = BridgeStateEnum.awaiting_scan
         _ = await self.save(session, commit=commit)
         qrcode_token_preview = (response.qrcode or '')[:8]
-        l.info(f"已获取 QR 码 (qrcode={qrcode_token_preview}***)，等待扫码")
+        l.info(
+            f"账号 '{self.account_name}' (self_id={self.self_id}) 已获取 QR 码 "
+            f"(qrcode={qrcode_token_preview}***)，等待扫码"
+        )
         return response
 
     async def check_qrcode_status(
@@ -743,7 +747,7 @@ class Bridge(
                 body=NotifyRequest(base_info=self._build_base_info()),
                 response_model=NotifyResponse,
             )
-            l.info("iLink notifystart 已发送")
+            l.info(f"iLink notifystart 已发送: account='{self.account_name}' (self_id={self.self_id})")
         except (ILinkAPIError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             l.warning(f"iLink notifystart 失败（不阻塞启动）: {type(e).__name__}: {e}")
 
@@ -759,7 +763,7 @@ class Bridge(
                 body=NotifyRequest(base_info=self._build_base_info()),
                 response_model=NotifyResponse,
             )
-            l.info("iLink notifystop 已发送")
+            l.info(f"iLink notifystop 已发送: account='{self.account_name}' (self_id={self.self_id})")
         except (ILinkAPIError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             l.warning(f"iLink notifystop 失败（不阻塞 shutdown）: {type(e).__name__}: {e}")
 
@@ -908,8 +912,20 @@ class Bridge(
         :return: True=登录成功；False=超时 / QR 过期 / 协议错误
         """
         # Step 1: 请求 QR 码
+        target_bridge_id = self.id
+        target_account_name = self.account_name
+
         async with session_factory() as session:
-            qr_response = await self.request_qrcode(session)
+            if target_bridge_id is not None:
+                bridge_in_db = await Bridge.get(session, col(Bridge.id) == target_bridge_id)
+            else:
+                bridge_in_db = await Bridge.get_by_name(session, target_account_name)
+            if bridge_in_db is None:
+                bridge_in_db = self
+            qr_response = await bridge_in_db.request_qrcode(session)
+            if bridge_in_db.id is not None:
+                target_bridge_id = bridge_in_db.id
+                self.id = bridge_in_db.id
 
         if qr_response.qrcode is None or qr_response.qrcode_img_content is None:
             l.error(
@@ -931,7 +947,12 @@ class Bridge(
             elapsed += QRCODE_POLL_INTERVAL_SECONDS
 
             async with session_factory() as session:
-                fresh_bridge = await Bridge.get_instance(session)
+                if target_bridge_id is not None:
+                    fresh_bridge = await Bridge.get(session, col(Bridge.id) == target_bridge_id)
+                else:
+                    fresh_bridge = await Bridge.get_by_name(session, target_account_name)
+                if fresh_bridge is None:
+                    fresh_bridge = self
                 status_response = await fresh_bridge.check_qrcode_status(
                     session, qrcode_token,
                 )
@@ -940,16 +961,32 @@ class Bridge(
                 l.success(
                     f"扫码登录成功: ilink_bot_id={status_response.ilink_bot_id}"
                 )
-                # check_qrcode_status 已经把 bridge 转回 running 并保存
                 self.state = BridgeStateEnum.running
                 self.bot_token = status_response.bot_token
                 self.wechat_id = status_response.ilink_bot_id
+                async with session_factory() as session:
+                    if target_bridge_id is not None:
+                        persisted = await Bridge.get(session, col(Bridge.id) == target_bridge_id)
+                    else:
+                        persisted = await Bridge.get_by_name(session, target_account_name)
+                    if persisted is not None:
+                        persisted.state = BridgeStateEnum.running
+                        persisted.bot_token = status_response.bot_token
+                        persisted.wechat_id = status_response.ilink_bot_id
+                        await persisted.save(session)
                 return True
 
             if status_response.status == ILinkQRStatusEnum.binded_redirect:
                 l.success("此 bot 已绑定到本应用（binded_redirect），视为登录成功")
-                # 不重写 bot_token（保持现有 DB 中的）
                 self.state = BridgeStateEnum.running
+                async with session_factory() as session:
+                    if target_bridge_id is not None:
+                        persisted = await Bridge.get(session, col(Bridge.id) == target_bridge_id)
+                    else:
+                        persisted = await Bridge.get_by_name(session, target_account_name)
+                    if persisted is not None:
+                        persisted.state = BridgeStateEnum.running
+                        await persisted.save(session)
                 return True
 
             if status_response.status == ILinkQRStatusEnum.expired:

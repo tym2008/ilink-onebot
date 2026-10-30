@@ -21,7 +21,10 @@ SessionDep = Annotated[AsyncSession, Depends(DatabaseManager.get_session)]
 
 
 async def _get_bridge(session: SessionDep) -> Bridge:
-    """从 session 加载 Bridge 单例（供 BridgeDep 使用，不直接给路由）"""
+    """从 session 加载 Bridge 实例（优先活跃账号，回退 default）"""
+    active = await Bridge.get_all_active(session)
+    if active:
+        return active[0]
     return await Bridge.get_instance(session)
 
 

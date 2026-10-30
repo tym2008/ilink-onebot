@@ -86,7 +86,8 @@ def _make_onebot_action_callback(
     async def _callback(action: OneBotAction) -> OneBotActionResponse:
         # 单独事务加载单例，避免污染 dispatch_action 内部的 session 生命周期
         async with session_factory() as session:
-            bridge = await Bridge.get_instance(session)
+            active_bridges = await Bridge.get_all_active(session)
+            bridge = active_bridges[0] if active_bridges else await Bridge.get_instance(session)
             config = await ServerConfig.get_instance(session)
         return await dispatch_action(bridge, session_factory, config, action)
 
@@ -156,6 +157,7 @@ async def _run_impl() -> None:
         # 3. 通知 iLink 服务端所有活跃客户端已启动（与官方 channel.ts 对齐，避免被误判离线）
         async with session_factory() as session:
             active_bridges = await Bridge.get_all_active(session)
+        l.info(f"通知 iLink 服务端所有活跃账号已启动（共 {len(active_bridges)} 个账号）")
         for b in active_bridges:
             await b.notify_start()
 
@@ -189,8 +191,8 @@ async def _run_impl() -> None:
             f"http://{meta_config.MEDIA_SERVE_HOST}:{meta_config.MEDIA_SERVE_PORT}"
         )
 
-        # 6. 启动 iLink 长轮询循环（显式注入 session_factory）
-        l.info("启动 iLink 长轮询循环")
+        # 6. 启动 iLink 并发长轮询循环（显式注入 session_factory）
+        l.info(f"启动 iLink 并发长轮询循环（共 {len(active_bridges)} 个活跃账号）")
         await PollingLoop.start(session_factory)
 
         # 7. 等待 SIGINT/SIGTERM

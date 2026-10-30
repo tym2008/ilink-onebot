@@ -67,7 +67,10 @@ class PollingLoop:
             if bridge.id is not None:
                 await cls.start_worker(bridge.id, session_factory)
 
-        l.success(f"iLink 长轮询循环已启动（当前活跃 worker 数: {len(cls._workers)}）")
+        l.success(
+            f"iLink 长轮询循环已启动（已并发启动 {len(cls._workers)} 个 worker 协程，"
+            f"同时在线账号: {[b.account_name for b in active_bridges]}）"
+        )
 
     @classmethod
     async def start_worker(
@@ -86,7 +89,10 @@ class PollingLoop:
         cls._workers[bridge_id] = asyncio.create_task(
             cls._run_bridge_worker(bridge_id, session_factory)
         )
-        l.info(f"Bridge [id={bridge_id}] 轮询 worker 已启动")
+        async with session_factory() as session:
+            b = await Bridge.get(session, col(Bridge.id) == bridge_id)
+            desc = f"account='{b.account_name}', self_id={b.self_id}" if b else f"id={bridge_id}"
+        l.info(f"Bridge [{desc}] 轮询 worker 任务已启动")
 
     @classmethod
     async def stop_worker(cls, bridge_id: int) -> None:

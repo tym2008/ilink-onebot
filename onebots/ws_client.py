@@ -32,7 +32,7 @@ from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from meta_config import meta_config
-from onebots.action_handler import push_pending_bootstrap_self_id
+from onebots.bootstrap_queue import push_pending_bootstrap_self_id
 from onebots.constants import (
     CLIENT_ROLE_UNIVERSAL,
     DEFAULT_USER_AGENT,

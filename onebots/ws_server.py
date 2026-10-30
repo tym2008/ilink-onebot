@@ -38,7 +38,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
 from meta_config import meta_config
-from onebots.action_handler import push_pending_bootstrap_self_id
+from onebots.bootstrap_queue import push_pending_bootstrap_self_id
 from onebots.constants import BEARER_PREFIX, QUERY_ACCESS_TOKEN_KEY
 from onebots.models import (
     OneBotAction,

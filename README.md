@@ -61,8 +61,12 @@ cp .env.example .env       # 端口、缓存路径等可在此处调整
 uv run ilink-onebot login
 ```
 
-**登录第二个账号（指定别名及可选的 self_id）：**
+**登录更多账号（自动或手动指定）：**
 ```bash
+# 方式 A：直接运行 login，系统检测到默认账号已登录会自动为新账号（bot2, bot3...）分配配额与 self_id
+uv run ilink-onebot login
+
+# 方式 B：手动指定别名及可选的 self_id
 uv run ilink-onebot login bot2 --self-id 10001
 ```
 
