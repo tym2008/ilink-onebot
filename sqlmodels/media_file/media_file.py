@@ -396,7 +396,7 @@ class MediaFile(MediaFileBase, TableBaseMixin, table=True):
             return self.cdn_full_url
         if self.cdn_encrypt_query_param is not None:
             from urllib.parse import quote
-            cdn_base = meta_config.ILINK_API_BASE_URL.rstrip('/')
+            cdn_base = meta_config.ILINK_CDN_BASE_URL.rstrip('/')
             return (
                 f"{cdn_base}/download?"
                 f"encrypted_query_param={quote(self.cdn_encrypt_query_param, safe='')}"
@@ -507,14 +507,19 @@ class MediaFile(MediaFileBase, TableBaseMixin, table=True):
                 reason=f"ilink_msg_type={ilink_msg_type!r} 不是媒体类型",
             )
 
-        source_url = segment.data.get('file') or segment.data.get('url')
-        if source_url is None or not source_url.strip():
+        source_url = (
+            segment.data.get('file')
+            or segment.data.get('url')
+            or segment.data.get('base64')
+        )
+        if source_url is None or not str(source_url).strip():
             raise MediaOutboundError(
                 user_id='unknown',
                 segment_type=segment.type,
                 stage='create',
-                reason=f"OneBot {segment.type} 段缺少 file/url 字段: {segment.data}",
+                reason=f"OneBot {segment.type} 段缺少 file/url/base64 字段: {segment.data}",
             )
+        source_url = str(source_url)
 
         file_name = _resolve_outbound_file_name(segment, source_url, ilink_msg_type)
         mime_type = _guess_mime_type(file_name, ilink_msg_type)
@@ -584,15 +589,24 @@ class MediaFile(MediaFileBase, TableBaseMixin, table=True):
 
         work_dir = Path(meta_config.MEDIA_CACHE_DIR) / 'outbound'
         await aiofiles.os.makedirs(work_dir, exist_ok=True)
-        source = self.onebot_source_url
+        source = self.onebot_source_url.strip()
 
         try:
             if source.startswith('base64://'):
-                local, size = await self._fetch_from_base64(source, work_dir)
+                local, size = await self._fetch_from_base64(source[len('base64://'):], work_dir)
+            elif source.startswith('data:') and ';base64,' in source:
+                local, size = await self._fetch_from_base64(source.split(';base64,', 1)[1], work_dir)
             elif source.startswith('http://') or source.startswith('https://'):
                 local, size = await self._fetch_from_http(source, bridge, work_dir)
-            else:
+            elif source.startswith('file://'):
                 local, size = await self._fetch_from_local_path(source)
+            else:
+                path_obj = Path(source)
+                if path_obj.exists():
+                    local, size = await self._fetch_from_local_path(source)
+                else:
+                    # 尝试按裸 base64 处理
+                    local, size = await self._fetch_from_base64(source, work_dir)
         except MediaOutboundError:
             raise
         except Exception as e:
@@ -611,13 +625,18 @@ class MediaFile(MediaFileBase, TableBaseMixin, table=True):
 
     async def _fetch_from_base64(
         self,
-        source: str,
+        b64_content: str,
         work_dir: Path,
     ) -> tuple[Path, int]:
-        """从 ``base64://...`` 解码到本地文件"""
-        b64_content = source[len('base64://'):]
+        """从 base64 字符串解码到本地文件"""
+        if b64_content.startswith('base64://'):
+            b64_content = b64_content[len('base64://'):]
+        if ';base64,' in b64_content:
+            b64_content = b64_content.split(';base64,', 1)[1]
+        b64_content = b64_content.strip()
+
         try:
-            data = base64.b64decode(b64_content, validate=True)
+            data = base64.b64decode(b64_content, validate=False)
         except (ValueError, BinasciiError) as e:
             raise MediaOutboundError(
                 user_id='unknown',
@@ -638,6 +657,7 @@ class MediaFile(MediaFileBase, TableBaseMixin, table=True):
             )
 
         local = (work_dir / f"{self.id}_{self.file_name}").absolute()
+        await aiofiles.os.makedirs(work_dir, exist_ok=True)
         async with aiofiles.open(local, 'wb') as f:
             _ = await f.write(data)
         return local, len(data)
@@ -767,19 +787,41 @@ class MediaFile(MediaFileBase, TableBaseMixin, table=True):
                 reason=f"{type(e).__name__}: {e}",
             ) from e
 
-        if upload_response.upload_full_url is None:
+        upload_full_url = (
+            upload_response.upload_full_url.strip()
+            if upload_response.upload_full_url is not None
+            else None
+        )
+        upload_param = (
+            upload_response.upload_param.strip()
+            if upload_response.upload_param is not None
+            else None
+        )
+
+        if upload_full_url:
+            target_upload_url = upload_full_url
+        elif upload_param:
+            from urllib.parse import quote
+            cdn_base = meta_config.ILINK_CDN_BASE_URL.rstrip('/')
+            # 对齐 Tencent/openclaw-weixin: buildCdnUploadUrl
+            target_upload_url = (
+                f"{cdn_base}/upload?"
+                f"encrypted_query_param={quote(upload_param, safe='')}"
+                f"&filekey={quote(self.filekey, safe='')}"
+            )
+        else:
             raise MediaOutboundError(
                 user_id=to_user_id,
                 segment_type=self.item_type.name,
                 stage='get_upload_url',
-                reason=f"iLink 未返回 upload_full_url: {upload_response}",
+                reason=f"iLink 未返回 upload_full_url 或 upload_param: {upload_response}",
             )
 
-        # Step 3: 流式加密 + PUT
+        # Step 3: 加密 + POST
         try:
             download_param = await self._stream_encrypt_and_post(
                 bridge=bridge,
-                upload_url=upload_response.upload_full_url,
+                upload_url=target_upload_url,
                 local_path=local,
             )
         except MediaOutboundError:
@@ -821,14 +863,11 @@ class MediaFile(MediaFileBase, TableBaseMixin, table=True):
         local_path: Path,
     ) -> str:
         """
-        流式本地文件 → AES 加密 → POST 上传到 iLink CDN。
+        本地文件 → AES 加密 → POST 上传到 iLink CDN。
 
-        协议：上传请求方法是 POST（与官方 cdn-upload.ts 一致），响应 200 + header
-        ``x-encrypted-param`` 包含后续 ``sendmessage`` 用的 download param。
-
-        不走 ``_http_request_with_retry``：重试机制会复用同一个 ``data`` async generator，
-        但其在首次请求已经耗尽，重试不可能成功。上传失败由调用方在 ``prepare_and_upload``
-        层级整体重试（重新构造 generator）。
+        协议：上传请求方法是 POST（对齐官方 cdn-upload.ts 与 CDN Media 协议规范），
+        必须携带明确的 Content-Length，响应 200 + header ``x-encrypted-param`` 包含后续
+        ``sendmessage`` 用的 download param。
 
         :return: CDN 响应 header ``x-encrypted-param`` 的值
         :raises MediaOutboundError: 缺 header / 非 2xx 响应
@@ -836,23 +875,18 @@ class MediaFile(MediaFileBase, TableBaseMixin, table=True):
         key = self.aes_key_bytes()
         encryptor = StreamAESEncryptor(key)
 
-        async def _encrypted_chunks():
-            async with aiofiles.open(local_path, 'rb') as f:
-                while True:
-                    chunk = await f.read(_DOWNLOAD_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    encrypted = encryptor.update(chunk)
-                    if encrypted:
-                        yield encrypted
-            tail = encryptor.finalize()
-            if tail:
-                yield tail
+        async with aiofiles.open(local_path, 'rb') as f:
+            plaintext = await f.read()
 
-        headers = {'Content-Type': 'application/octet-stream'}
+        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+
+        headers = {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': str(len(ciphertext)),
+        }
         async with bridge.http_session.post(
             upload_url,
-            data=_encrypted_chunks(),
+            data=ciphertext,
             headers=headers,
         ) as resp:
             if not (200 <= resp.status < 300):

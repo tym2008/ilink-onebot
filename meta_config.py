@@ -67,6 +67,9 @@ class MetaConfig(BaseSettings):
     ILINK_API_BASE_URL: str = 'https://ilinkai.weixin.qq.com'
     """iLink API 基础 URL（默认为微信官方，调试时可指向 mock 服务）"""
 
+    ILINK_CDN_BASE_URL: str = 'https://novac2c.cdn.weixin.qq.com/c2c'
+    """iLink 富媒体 CDN 基础 URL（对齐 Tencent/openclaw-weixin 默认 cdnBaseUrl）"""
+
     # ===== OneBot v11 协议层 =====
 
     ONEBOT_WS_HOST: str = '0.0.0.0'
